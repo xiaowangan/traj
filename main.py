@@ -194,9 +194,10 @@ class PreviewCanvas(QWidget):
             self._canvas3d.draw()
             return
 
-        xs = [p[0] for p in points]
-        ys = [p[1] for p in points]
-        zs = [p[2] for p in points]
+        import numpy as _np
+        xs = _np.array([p[0] for p in points], dtype=float)
+        ys = _np.array([p[1] for p in points], dtype=float)
+        zs = _np.array([p[2] for p in points], dtype=float)
 
         # 散点用 Z 着色（红=高，蓝=低），每隔几点画一个避免过密
         skip = max(1, len(points) // 2000)
@@ -205,8 +206,27 @@ class PreviewCanvas(QWidget):
                         s=8, zorder=3, depthshade=True)
 
         # 路径线（降采样，半透明）
-        ax.plot(xs[::skip], ys[::skip], zs[::skip],
-                "-", color="#2563b0", lw=0.5, alpha=0.4)
+        # 在“跳跃”处插入 NaN 切断折线：当相邻两点的距离远大于中位距离时，
+        # 视为投影裁剪导致的非连续轨迹（例如螺旋线被矩形边界截断后两条臂之间的连接），
+        # 不再以直线相连，避免在曲面上画出穿越图形的虚假线段。
+        xs_p = xs[::skip].copy()
+        ys_p = ys[::skip].copy()
+        zs_p = zs[::skip].copy()
+        if len(xs_p) >= 3:
+            seg = _np.sqrt(_np.diff(xs_p) ** 2 + _np.diff(ys_p) ** 2 + _np.diff(zs_p) ** 2)
+            med = _np.median(seg[seg > 0]) if _np.any(seg > 0) else 0.0
+            if med > 0:
+                # 阈值：超过中位距离 5 倍即视为跳跃
+                jump_idx = _np.where(seg > 5 * med)[0]
+                if len(jump_idx) > 0:
+                    # 在第 i 与 i+1 之间断开 → 把 i+1 位置改成 NaN（matplotlib 会自动断开折线）
+                    # 用 insert 不会破坏散点（散点用单独数组）
+                    xs_p = xs_p.astype(float); ys_p = ys_p.astype(float); zs_p = zs_p.astype(float)
+                    for i in jump_idx[::-1]:
+                        xs_p = _np.insert(xs_p, i + 1, _np.nan)
+                        ys_p = _np.insert(ys_p, i + 1, _np.nan)
+                        zs_p = _np.insert(zs_p, i + 1, _np.nan)
+        ax.plot(xs_p, ys_p, zs_p, "-", color="#2563b0", lw=0.5, alpha=0.4)
 
         # 起点 / 终点
         ax.scatter([xs[0]],  [ys[0]],  [zs[0]],
@@ -226,6 +246,16 @@ class PreviewCanvas(QWidget):
         ax.set_ylabel("Y (mm)", fontsize=9, labelpad=6)
         ax.set_zlabel("Z (mm)", fontsize=9, labelpad=6)
         ax.legend(loc="upper left", fontsize=8, framealpha=0.85)
+
+        # 关键：按数据真实尺寸设置 3D 盒子的长宽高比，让 X/Y/Z 同比例显示。
+        # 否则非球面（X/Y 大、Z 小）会被拉伸，柱面也会失真。
+        x_rng = float(xs.max() - xs.min())
+        y_rng = float(ys.max() - ys.min())
+        z_rng = float(zs.max() - zs.min())
+        # 防止某一维为 0 导致 set_box_aspect 报错
+        eps = max(x_rng, y_rng, z_rng) * 1e-3 + 1e-6
+        ax.set_box_aspect((max(x_rng, eps), max(y_rng, eps), max(z_rng, eps)))
+
         self._fig3d.tight_layout()
         self._canvas3d.draw()
 # ════════════════════════════════════════════════════════════════════
@@ -245,8 +275,7 @@ class ControlPanel(QStackedWidget):
         self.idx_license = self.count()
         self.addWidget(self._build_license_page())
 
-        # 曲面轨迹：统一入口页（下拉选择 + 子页面）
-        self.idx_surface = self.count()
+        # 曲面轨迹：统一入口页（下拉选择 + 子页面）        self.idx_surface = self.count()
         self.addWidget(self._build_surface_selector_page())
 
         # 当前缓存的轨迹点和参数
@@ -1348,10 +1377,10 @@ class ControlPanel(QStackedWidget):
         self.cyl_cmb_dir = QComboBox()
         self.cyl_cmb_dir.addItems(["X方向步进", "Y方向步进"])
         combox_input(g3, "栅形方向：", self.cyl_cmb_dir)
-        self.cyl_edt_step,    row_st  = lineedit_input("步长 (mm)：",    "1.0")
-        self.cyl_edt_spacing, row_sp  = lineedit_input("线间距 (mm)：",  "5.0")
-        self.cyl_edt_pitch,   row_pit = lineedit_input("螺距 (mm)：",    "5.0")
-        self.cyl_edt_arcstep, row_as  = lineedit_input("弧长步长 (mm)：","1.0")
+        self.cyl_edt_step,    row_st  = lineedit_input("步长 (mm)：",    "0.08")
+        self.cyl_edt_spacing, row_sp  = lineedit_input("线间距 (mm)：",  "0.5")
+        self.cyl_edt_pitch,   row_pit = lineedit_input("螺距 (mm)：",    "0.5")
+        self.cyl_edt_arcstep, row_as  = lineedit_input("弧长步长 (mm)：","0.08")
         for row in [row_st, row_sp, row_pit, row_as]:
             g3.addLayout(row)
         layout.addWidget(grp3)
