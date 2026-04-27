@@ -7,6 +7,7 @@
   - 左侧中央区域显示轨迹预览图
   - 底部状态栏
   - 背景色 #dfe9f5，字体微软雅黑
+  随机采样
 """
 
 import sys
@@ -229,58 +230,34 @@ class PreviewCanvas(QWidget):
                     zp = _np.insert(zp, i+1, _np.nan)
             return xp, yp, zp
 
-        # ── 左图：根据几何参数渲染真实曲面形状（surface mesh）──────────
+        # ── 左图：曲面形状（密集散点云）─────────────────────────────
         ax_s = self._ax3d_surf
         ax_s.set_facecolor("#f0f5fc")
-        n_pts = len(points)
-
-        geom = params.get("geom")  # 由各 _do_generate_xxx 注入；没有就回退到散点
-        sm_for_cbar = None  # 用于 colorbar 的 ScalarMappable
-        if geom is not None:
-            try:
-                sm_for_cbar = self._render_surface_from_geom(ax_s, geom)
-            except Exception as _e:
-                print("[plot_surface] 几何渲染失败，回退到散点：", _e)
-                sm_for_cbar = None
-
-        if sm_for_cbar is None:
-            # 回退：等间隔降采样的散点云
-            MAX_DISPLAY = 50000
-            if n_pts > MAX_DISPLAY:
-                stride = int(_np.ceil(n_pts / MAX_DISPLAY))
-                idx_s = _np.arange(0, n_pts, stride)
-            else:
-                idx_s = _np.arange(n_pts)
-            xs_s = xs[idx_s]; ys_s = ys[idx_s]; zs_s = zs[idx_s]
-            s_size = 6 if len(idx_s) <= 8000 else (3 if len(idx_s) <= 25000 else 1.5)
-            sm_for_cbar = ax_s.scatter(xs_s, ys_s, zs_s, c=zs_s, cmap="jet",
-                                       s=s_size, zorder=3, depthshade=True, alpha=0.85)
-
-        self._cb3d_surf = self._fig3d.colorbar(sm_for_cbar, ax=ax_s, shrink=0.5, pad=0.12)
+        idx_s = _np.random.choice(len(points), min(10000, len(points)), replace=False)
+        idx_s.sort()
+        xs_s = xs[idx_s];
+        ys_s = ys[idx_s];
+        zs_s = zs[idx_s]
+        sc_s = ax_s.scatter(xs_s, ys_s, zs_s, c=zs_s, cmap="jet",
+                            s=6, zorder=3, depthshade=True, alpha=0.85)
+        self._cb3d_surf = self._fig3d.colorbar(sc_s, ax=ax_s, shrink=0.5, pad=0.12)
         self._cb3d_surf.set_label("Z (mm)", fontsize=8)
         ax_s.set_title(f"{surface_name} 形状", fontsize=10, color="#1a3f6f", pad=8)
         ax_s.set_xlabel("X (mm)", fontsize=8, labelpad=4)
         ax_s.set_ylabel("Y (mm)", fontsize=8, labelpad=4)
         ax_s.set_zlabel("Z (mm)", fontsize=8, labelpad=4)
-        # 用轨迹点的实际范围设定坐标比例（保证左右两图视角一致）
         _set_aspect(ax_s, xs, ys, zs)
 
         # ── 右图：轨迹路径（密集散点 + 起终点，不画连线避免菱形混乱）──
         ax_t = self._ax3d_traj
         ax_t.set_facecolor("#f0f5fc")
-        # 等间隔降采样（保持轨迹原始顺序）
-        MAX_DISPLAY = 50000
-        if n_pts > MAX_DISPLAY:
-            stride = int(_np.ceil(n_pts / MAX_DISPLAY))
-            idx_t = _np.arange(0, n_pts, stride)
-        else:
-            idx_t = _np.arange(n_pts)
-        xs_t = xs[idx_t]
-        ys_t = ys[idx_t]
+        idx_t = _np.random.choice(len(points), min(10000, len(points)), replace=False)
+        idx_t.sort()
+        xs_t = xs[idx_t];
+        ys_t = ys[idx_t];
         zs_t = zs[idx_t]
-        s_size = 6 if len(idx_t) <= 8000 else (3 if len(idx_t) <= 25000 else 1.5)
         sc_t = ax_t.scatter(xs_t, ys_t, zs_t, c=zs_t, cmap="jet",
-                            s=s_size, zorder=3, depthshade=True, alpha=0.85)
+                            s=6, zorder=3, depthshade=True, alpha=0.85)
         ax_t.scatter([xs[0]], [ys[0]], [zs[0]],
                      s=60, color="#27ae60", zorder=5, marker="^", label="起点")
         ax_t.scatter([xs[-1]], [ys[-1]], [zs[-1]],
@@ -297,232 +274,6 @@ class PreviewCanvas(QWidget):
 
         self._fig3d.tight_layout()
         self._canvas3d.draw()
-
-    # ────────────────────────────────────────────────────────────────
-    # 根据几何参数渲染实体曲面（球面 / 非球面 / 柱面 / 锥面）
-    # geom 字典格式约定（由各 _do_generate_xxx 注入）：
-    #   {"type": "spherical",  "R":..., "zc":..., "h":..., "surf_type":"convex"/"concave"}
-    #   {"type": "aspherical", "R":..., "k":..., "A4..A14":..., "offcenter":...,
-    #                          "bound_type":1/2/3, "full_width":..., "full_length":...,
-    #                          "rect_xmin/xmax/ymin/ymax":..., "circ_R/xc/yc":...}
-    #   {"type": "cylindrical","R":..., "zc":..., "k_cut":..., "axis_dir":"X"/"Y",
-    #                          "surf_type":"C"/"V", "axis_min/max":...,
-    #                          "proj_shape":"R"/"C", "proj_R":...}
-    #   {"type": "conical",    "cone_type":1/2, "alpha_deg":..., "H":...,
-    #                          "cover_type":1/2/3, ...}
-    # 返回值：用于 colorbar 的 ScalarMappable（plot_surface 的返回对象）；失败返回 None
-    # ────────────────────────────────────────────────────────────────
-    def _render_surface_from_geom(self, ax, geom):
-        import numpy as _np
-        from matplotlib import cm
-        from matplotlib.colors import Normalize
-
-        kind = geom.get("type", "")
-
-        # ====================== 球面 ======================
-        if kind == "spherical":
-            R = float(geom["R"]); zc = float(geom.get("zc", 0.0))
-            h = float(geom["h"]); st = geom.get("surf_type", "convex")
-            # 构造在投影圆 r_proj 上的极坐标网格
-            if st == "convex":
-                z_cut = zc + R - h
-                r_proj = _np.sqrt(max(0.0, R*R - (z_cut - zc)**2))
-                z0 = z_cut  # 用于将 Z 平移到从 0 起
-                sign = +1
-            else:
-                z_cut = zc - R
-                z_top = z_cut + h
-                r_proj = _np.sqrt(max(0.0, R*R - (z_top - zc)**2))
-                z0 = z_cut
-                sign = -1
-            if r_proj < 1e-9:
-                return None
-            n_u, n_v = 80, 60
-            u = _np.linspace(0.0, 2*_np.pi, n_u)
-            v = _np.linspace(0.0, r_proj,   n_v)
-            U, V = _np.meshgrid(u, v)
-            X = V * _np.cos(U)
-            Y = V * _np.sin(U)
-            r2 = X*X + Y*Y
-            sq = _np.sqrt(_np.maximum(0.0, R*R - r2))
-            Z_abs = zc + sign * sq
-            Z = Z_abs - z0  # 与轨迹的 z_rel 对齐
-            return self._draw_jet_surface(ax, X, Y, Z)
-
-        # ====================== 非球面 ======================
-        if kind == "aspherical":
-            R   = float(geom["R"]);  k = float(geom.get("k", 0.0))
-            A4  = float(geom.get("A4",  0.0)); A6  = float(geom.get("A6",  0.0))
-            A8  = float(geom.get("A8",  0.0)); A10 = float(geom.get("A10", 0.0))
-            A12 = float(geom.get("A12", 0.0)); A14 = float(geom.get("A14", 0.0))
-            off = float(geom.get("offcenter", 0.0))
-            bt  = int(geom.get("bound_type", 1))
-            if R == 0:
-                return None
-            C = -1.0 / R
-
-            def asp_z(x, y):
-                ys = y - off
-                r2 = x*x + ys*ys
-                under = 1.0 - (1.0 + k) * C*C * r2
-                sq = _np.sqrt(_np.maximum(0.0, under))
-                denom = 1.0 + sq
-                Z = (C * r2) / denom + (A4*r2**2 + A6*r2**3 + A8*r2**4 +
-                                         A10*r2**5 + A12*r2**6 + A14*r2**7)
-                return Z
-
-            if bt == 1:
-                W = float(geom.get("full_width", 0.0))
-                L = float(geom.get("full_length", 0.0))
-                if W <= 0 or L <= 0: return None
-                xs_g = _np.linspace(-W/2, W/2, 80)
-                ys_g = _np.linspace(-L/2, L/2, 80)
-                X, Y = _np.meshgrid(xs_g, ys_g)
-                Z = asp_z(X, Y)
-                return self._draw_jet_surface(ax, X, Y, Z)
-            elif bt == 2:
-                xmn = float(geom["rect_xmin"]); xmx = float(geom["rect_xmax"])
-                ymn = float(geom["rect_ymin"]); ymx = float(geom["rect_ymax"])
-                xs_g = _np.linspace(xmn, xmx, 80)
-                ys_g = _np.linspace(ymn, ymx, 80)
-                X, Y = _np.meshgrid(xs_g, ys_g)
-                Z = asp_z(X, Y)
-                return self._draw_jet_surface(ax, X, Y, Z)
-            else:
-                cR  = float(geom["circ_R"])
-                cxc = float(geom.get("circ_xc", 0.0))
-                cyc = float(geom.get("circ_yc", 0.0))
-                if cR <= 0: return None
-                u = _np.linspace(0.0, 2*_np.pi, 80)
-                v = _np.linspace(0.0, cR,       60)
-                U, V = _np.meshgrid(u, v)
-                X = cxc + V*_np.cos(U)
-                Y = cyc + V*_np.sin(U)
-                Z = asp_z(X, Y)
-                return self._draw_jet_surface(ax, X, Y, Z)
-
-        # ====================== 柱面 ======================
-        if kind == "cylindrical":
-            R    = float(geom["R"])
-            zc   = float(geom.get("zc", 0.0))
-            kcut = float(geom.get("k_cut", zc - R))
-            axis_dir = geom.get("axis_dir", "Y")
-            st   = geom.get("surf_type", "C")  # C 凸, V 凹
-            amin = float(geom["axis_min"]); amax = float(geom["axis_max"])
-            proj = geom.get("proj_shape", "R")
-            proj_R = float(geom.get("proj_R", 0.0))
-
-            delta_z = kcut - zc
-            if abs(delta_z) > R: return None
-            d_max = _np.sqrt(R*R - delta_z*delta_z)
-            z0 = kcut if st == "C" else (zc - R)
-            sign = +1 if st == "C" else -1
-
-            # 横向（沿轴线）网格
-            n_axis, n_arc = 60, 80
-            t_axis = _np.linspace(amin, amax, n_axis)
-            # 横截面参数：用偏离中心的距离 d，d ∈ [-d_eff, +d_eff]
-            d_eff = min(proj_R, d_max) if proj == "C" else d_max
-            d_grid = _np.linspace(-d_eff, d_eff, n_arc)
-
-            T, D = _np.meshgrid(t_axis, d_grid)
-            sq = _np.sqrt(_np.maximum(0.0, R*R - D*D))
-            Z_abs = zc + sign * sq
-
-            if axis_dir == "Y":
-                X = D
-                Y = T
-            else:
-                X = T
-                Y = D
-
-            # 圆形投影时再裁掉超出半径的部分（轴向视圆心 0）
-            if proj == "C" and proj_R > 0:
-                if axis_dir == "Y":
-                    mask = (X*X + (Y - 0.5*(amin+amax))**2) <= proj_R**2 + 1e-6
-                else:
-                    mask = ((X - 0.5*(amin+amax))**2 + Y*Y) <= proj_R**2 + 1e-6
-                Z_abs = _np.where(mask, Z_abs, _np.nan)
-
-            Z = Z_abs - z0
-            return self._draw_jet_surface(ax, X, Y, Z)
-
-        # ====================== 锥面 ======================
-        if kind == "conical":
-            ctype = int(geom.get("cone_type", 1))     # 1 凸, 2 凹
-            alpha = float(geom["alpha_deg"]) * _np.pi / 180.0
-            H     = float(geom["H"])
-            cover = int(geom.get("cover_type", 1))
-            tan_a = _np.tan(alpha)
-            R_base = H * tan_a
-            if R_base <= 0: return None
-
-            def z_cone_arr(r):
-                if ctype == 1:
-                    return H - r/tan_a
-                return r/tan_a
-
-            if cover == 1:
-                u = _np.linspace(0.0, 2*_np.pi, 90)
-                v = _np.linspace(0.0, R_base,   60)
-                U, V = _np.meshgrid(u, v)
-                X = V*_np.cos(U); Y = V*_np.sin(U)
-                R = _np.hypot(X, Y)
-                Z = z_cone_arr(R)
-                return self._draw_jet_surface(ax, X, Y, Z)
-            elif cover == 2:
-                xmn = float(geom["rect_xmin"]); xmx = float(geom["rect_xmax"])
-                ymn = float(geom["rect_ymin"]); ymx = float(geom["rect_ymax"])
-                xs_g = _np.linspace(xmn, xmx, 80)
-                ys_g = _np.linspace(ymn, ymx, 80)
-                X, Y = _np.meshgrid(xs_g, ys_g)
-                R = _np.hypot(X, Y)
-                Z = z_cone_arr(R)
-                Z = _np.where(R <= R_base + 1e-6, Z, _np.nan)
-                return self._draw_jet_surface(ax, X, Y, Z)
-            else:
-                cR  = float(geom["circ_R"])
-                cxc = float(geom.get("circ_xc", 0.0))
-                cyc = float(geom.get("circ_yc", 0.0))
-                if cR <= 0: return None
-                u = _np.linspace(0.0, 2*_np.pi, 90)
-                v = _np.linspace(0.0, cR,       60)
-                U, V = _np.meshgrid(u, v)
-                X = cxc + V*_np.cos(U); Y = cyc + V*_np.sin(U)
-                R = _np.hypot(X, Y)
-                Z = z_cone_arr(R)
-                Z = _np.where(R <= R_base + 1e-6, Z, _np.nan)
-                return self._draw_jet_surface(ax, X, Y, Z)
-
-        # 不支持的类型
-        return None
-
-    @staticmethod
-    def _draw_jet_surface(ax, X, Y, Z):
-        """以 jet 配色绘制实体曲面，返回可作 colorbar 的 ScalarMappable。"""
-        import numpy as _np
-        import matplotlib
-        from matplotlib import cm
-        from matplotlib.colors import Normalize
-        Zfin = Z[_np.isfinite(Z)]
-        if Zfin.size == 0:
-            return None
-        zmin, zmax = float(Zfin.min()), float(Zfin.max())
-        if zmax - zmin < 1e-9:
-            zmax = zmin + 1e-9
-        norm = Normalize(vmin=zmin, vmax=zmax)
-        try:
-            cmap = matplotlib.colormaps["jet"]
-        except (AttributeError, KeyError):
-            cmap = cm.get_cmap("jet")
-        colors = cmap(norm(_np.nan_to_num(Z, nan=zmin)))
-        ax.plot_surface(X, Y, Z, facecolors=colors,
-                        rstride=1, cstride=1, linewidth=0,
-                        antialiased=True, shade=False, alpha=0.95)
-        sm = cm.ScalarMappable(norm=norm, cmap=cmap)
-        sm.set_array([])
-        return sm
-
 # ════════════════════════════════════════════════════════════════════
 class ControlPanel(QStackedWidget):
     """
@@ -1494,19 +1245,7 @@ class ControlPanel(QStackedWidget):
         if not pts:
             QMessageBox.warning(self._main, "警告", "未生成任何轨迹点"); return
         tname = "栅形" if traj == "G" else "螺旋线"
-        # 把非球面几何参数收进 geom（左图按此渲染实体曲面）
-        geom = {"type": "aspherical",
-                "R": R, "k": k, "A4": A4, "A6": A6, "A8": A8,
-                "A10": A10, "A12": A12, "A14": A14,
-                "offcenter": off, "bound_type": bound,
-                "full_width": W, "full_length": L}
-        if bound == 2:
-            geom.update(rect_xmin=kwargs["rect_xmin"], rect_xmax=kwargs["rect_xmax"],
-                        rect_ymin=kwargs["rect_ymin"], rect_ymax=kwargs["rect_ymax"])
-        elif bound == 3:
-            geom.update(circ_R=kwargs["circ_R"], circ_xc=kwargs["circ_xc"],
-                        circ_yc=kwargs["circ_yc"])
-        params = {"surface_name": "非球面", "traj_name": tname + "轨迹", "geom": geom}
+        params = {"surface_name": "非球面", "traj_name": tname + "轨迹"}
         self._finish(pts, params, self.asp_btn_save, self.asp_info_lbl,
                      f"非球面{tname}轨迹", is_surface=True)
 
@@ -1611,9 +1350,7 @@ class ControlPanel(QStackedWidget):
             QMessageBox.warning(self._main, "警告", "未生成任何轨迹点"); return
         tname = "栅形" if traj == "G" else "螺旋线"
         surf_cn = "凸球面" if surf == "convex" else "凹球面"
-        params = {"surface_name": surf_cn, "traj_name": tname + "轨迹",
-                  "geom": {"type": "spherical",
-                           "R": R, "zc": zc, "h": h, "surf_type": surf}}
+        params = {"surface_name": surf_cn, "traj_name": tname + "轨迹"}
         self._finish(pts, params, self.sph_btn_save, self.sph_info_lbl,
                      f"{surf_cn}{tname}轨迹", is_surface=True)
 
@@ -1747,12 +1484,7 @@ class ControlPanel(QStackedWidget):
             QMessageBox.warning(self._main, "警告", "未生成任何轨迹点"); return
         tname = "栅形" if traj == "G" else "螺旋线"
         surf_cn = "凸柱面" if surf == "C" else "凹柱面"
-        params = {"surface_name": surf_cn, "traj_name": tname + "轨迹",
-                  "geom": {"type": "cylindrical",
-                           "R": R, "zc": zc, "k_cut": k_cut,
-                           "axis_dir": axis, "surf_type": surf,
-                           "axis_min": amin, "axis_max": amax,
-                           "proj_shape": proj, "proj_R": proj_R}}
+        params = {"surface_name": surf_cn, "traj_name": tname + "轨迹"}
         self._finish(pts, params, self.cyl_btn_save, self.cyl_info_lbl,
                      f"{surf_cn}{tname}轨迹", is_surface=True)
 
@@ -1908,15 +1640,7 @@ class ControlPanel(QStackedWidget):
             QMessageBox.warning(self._main, "警告", "未生成任何轨迹点"); return
         tname = "栅形" if traj == "G" else "螺旋线"
         surf_cn = "凸锥面" if ctype == 1 else "凹锥面"
-        geom = {"type": "conical", "cone_type": ctype, "alpha_deg": alpha,
-                "H": H, "cover_type": cover}
-        if cover == 2:
-            geom.update(rect_xmin=kwargs["rect_xmin"], rect_xmax=kwargs["rect_xmax"],
-                        rect_ymin=kwargs["rect_ymin"], rect_ymax=kwargs["rect_ymax"])
-        elif cover == 3:
-            geom.update(circ_R=kwargs["circ_R"], circ_xc=kwargs["circ_xc"],
-                        circ_yc=kwargs["circ_yc"])
-        params = {"surface_name": surf_cn, "traj_name": tname + "轨迹", "geom": geom}
+        params = {"surface_name": surf_cn, "traj_name": tname + "轨迹"}
         self._finish(pts, params, self.con_btn_save, self.con_info_lbl,
                      f"{surf_cn}{tname}轨迹", is_surface=True)
 
