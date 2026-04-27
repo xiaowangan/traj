@@ -88,11 +88,11 @@ class PreviewCanvas(QWidget):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(6, 6, 6, 6)
 
-        # ── 两个独立画布，用 QStackedWidget 切换 ──
+        # ── 两个独立画布，用 QStackedWidget 切换（平面2D / 曲面双3D） ──
         self._stack = QStackedWidget()
         outer.addWidget(self._stack)
 
-        # 画布 0：平面轨迹（2D）
+        # ── 画布 0：平面轨迹（2D 单图） ──
         self._fig2d, self._ax2d = plt.subplots(figsize=(7, 6), dpi=96)
         self._fig2d.patch.set_facecolor("#dfe9f5")
         self._ax2d.set_facecolor("#f0f5fc")
@@ -103,12 +103,16 @@ class PreviewCanvas(QWidget):
         self._stack.addWidget(w2d)   # idx 0
         self._canvas2d = canvas2d
 
-        # 画布 1：曲面轨迹（3D + colorbar）
+        # ── 画布 1：曲面轨迹（左=曲面形状，右=轨迹，并排 3D） ──
         from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
-        self._fig3d = plt.figure(figsize=(8, 6), dpi=96)
+        self._fig3d = plt.figure(figsize=(14, 6), dpi=96)
         self._fig3d.patch.set_facecolor("#dfe9f5")
-        self._ax3d  = self._fig3d.add_subplot(111, projection="3d")
-        self._cb3d  = None   # colorbar 句柄，每次重建前先删
+        # 左子图：曲面形状（密集散点云）
+        self._ax3d_surf = self._fig3d.add_subplot(121, projection="3d")
+        # 右子图：轨迹路径
+        self._ax3d_traj = self._fig3d.add_subplot(122, projection="3d")
+        self._cb3d  = None   # colorbar 句柄（绑在右图），每次重建前先删
+        self._cb3d_surf = None  # colorbar 句柄（绑在左图）
         canvas3d = FigureCanvas(self._fig3d)
         canvas3d.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         w3d = QWidget(); l3d = QVBoxLayout(w3d); l3d.setContentsMargins(0,0,0,0)
@@ -176,21 +180,24 @@ class PreviewCanvas(QWidget):
         self._fig2d.tight_layout()
         self._canvas2d.draw()
 
-    # ── 曲面轨迹：3D 画布 + colorbar ──────────────────────────────
+    # ── 曲面轨迹：左=曲面形状，右=轨迹路径（并排 3D 双视图） ───────
     def plot_surface(self, points, params):
         self._stack.setCurrentIndex(1)
 
-        # 彻底重建 3D axes 和 colorbar，确保切换轨迹时完全清空
         if self._cb3d is not None:
-            self._cb3d.remove()
+            try: self._cb3d.remove()
+            except: pass
             self._cb3d = None
+        if self._cb3d_surf is not None:
+            try: self._cb3d_surf.remove()
+            except: pass
+            self._cb3d_surf = None
         self._fig3d.clear()
-        self._ax3d = self._fig3d.add_subplot(111, projection="3d")
-        ax = self._ax3d
-        ax.set_facecolor("#f0f5fc")
+        self._ax3d_surf = self._fig3d.add_subplot(121, projection="3d")
+        self._ax3d_traj = self._fig3d.add_subplot(122, projection="3d")
 
         if not points:
-            ax.set_title("未生成任何轨迹点", fontsize=11, color="#c0392b")
+            self._ax3d_traj.set_title("未生成任何轨迹点", fontsize=11, color="#c0392b")
             self._canvas3d.draw()
             return
 
@@ -199,62 +206,70 @@ class PreviewCanvas(QWidget):
         ys = _np.array([p[1] for p in points], dtype=float)
         zs = _np.array([p[2] for p in points], dtype=float)
 
-        # 散点用 Z 着色（红=高，蓝=低），每隔几点画一个避免过密
-        skip = max(1, len(points) // 2000)
-        xs_s = xs[::skip]; ys_s = ys[::skip]; zs_s = zs[::skip]
-        sc = ax.scatter(xs_s, ys_s, zs_s, c=zs_s, cmap="jet",
-                        s=8, zorder=3, depthshade=True)
-
-        # 路径线（降采样，半透明）
-        # 在“跳跃”处插入 NaN 切断折线：当相邻两点的距离远大于中位距离时，
-        # 视为投影裁剪导致的非连续轨迹（例如螺旋线被矩形边界截断后两条臂之间的连接），
-        # 不再以直线相连，避免在曲面上画出穿越图形的虚假线段。
-        xs_p = xs[::skip].copy()
-        ys_p = ys[::skip].copy()
-        zs_p = zs[::skip].copy()
-        if len(xs_p) >= 3:
-            seg = _np.sqrt(_np.diff(xs_p) ** 2 + _np.diff(ys_p) ** 2 + _np.diff(zs_p) ** 2)
-            med = _np.median(seg[seg > 0]) if _np.any(seg > 0) else 0.0
-            if med > 0:
-                # 阈值：超过中位距离 5 倍即视为跳跃
-                jump_idx = _np.where(seg > 5 * med)[0]
-                if len(jump_idx) > 0:
-                    # 在第 i 与 i+1 之间断开 → 把 i+1 位置改成 NaN（matplotlib 会自动断开折线）
-                    # 用 insert 不会破坏散点（散点用单独数组）
-                    xs_p = xs_p.astype(float); ys_p = ys_p.astype(float); zs_p = zs_p.astype(float)
-                    for i in jump_idx[::-1]:
-                        xs_p = _np.insert(xs_p, i + 1, _np.nan)
-                        ys_p = _np.insert(ys_p, i + 1, _np.nan)
-                        zs_p = _np.insert(zs_p, i + 1, _np.nan)
-        ax.plot(xs_p, ys_p, zs_p, "-", color="#2563b0", lw=0.5, alpha=0.4)
-
-        # 起点 / 终点
-        ax.scatter([xs[0]],  [ys[0]],  [zs[0]],
-                   s=60, color="#27ae60", zorder=5, marker="^", label="起点")
-        ax.scatter([xs[-1]], [ys[-1]], [zs[-1]],
-                   s=60, color="#c0392b", zorder=5, marker="s", label="终点")
-
-        # colorbar（新建，附注说明）
-        self._cb3d = self._fig3d.colorbar(sc, ax=ax, shrink=0.55, pad=0.1)
-        self._cb3d.set_label("Z (mm)  ←蓝低  红高→", fontsize=9)
-
         surface_name = params.get("surface_name", "曲面")
         traj_name    = params.get("traj_name", "")
-        ax.set_title(f"{surface_name} · {traj_name}  共 {len(points)} 个轨迹点",
-                     fontsize=10, color="#1a3f6f", pad=10)
-        ax.set_xlabel("X (mm)", fontsize=9, labelpad=6)
-        ax.set_ylabel("Y (mm)", fontsize=9, labelpad=6)
-        ax.set_zlabel("Z (mm)", fontsize=9, labelpad=6)
-        ax.legend(loc="upper left", fontsize=8, framealpha=0.85)
 
-        # 关键：按数据真实尺寸设置 3D 盒子的长宽高比，让 X/Y/Z 同比例显示。
-        # 否则非球面（X/Y 大、Z 小）会被拉伸，柱面也会失真。
-        x_rng = float(xs.max() - xs.min())
-        y_rng = float(ys.max() - ys.min())
-        z_rng = float(zs.max() - zs.min())
-        # 防止某一维为 0 导致 set_box_aspect 报错
-        eps = max(x_rng, y_rng, z_rng) * 1e-3 + 1e-6
-        ax.set_box_aspect((max(x_rng, eps), max(y_rng, eps), max(z_rng, eps)))
+        def _set_aspect(ax, xs_, ys_, zs_):
+            x_rng = float(xs_.max() - xs_.min())
+            y_rng = float(ys_.max() - ys_.min())
+            z_rng = float(zs_.max() - zs_.min())
+            eps = max(x_rng, y_rng, z_rng) * 1e-3 + 1e-6
+            ax.set_box_aspect((max(x_rng, eps), max(y_rng, eps), max(z_rng, eps)))
+
+        def _break_jumps(xs_, ys_, zs_):
+            if len(xs_) < 3:
+                return xs_.copy(), ys_.copy(), zs_.copy()
+            seg = _np.sqrt(_np.diff(xs_)**2 + _np.diff(ys_)**2 + _np.diff(zs_)**2)
+            med = _np.median(seg[seg > 0]) if _np.any(seg > 0) else 0.0
+            xp, yp, zp = xs_.astype(float), ys_.astype(float), zs_.astype(float)
+            if med > 0:
+                for i in _np.where(seg > 1.5 * med)[0][::-1]:
+                    xp = _np.insert(xp, i+1, _np.nan)
+                    yp = _np.insert(yp, i+1, _np.nan)
+                    zp = _np.insert(zp, i+1, _np.nan)
+            return xp, yp, zp
+
+        # ── 左图：曲面形状（密集散点云）─────────────────────────────
+        ax_s = self._ax3d_surf
+        ax_s.set_facecolor("#f0f5fc")
+        idx_s = _np.random.choice(len(points), min(10000, len(points)), replace=False)
+        idx_s.sort()
+        xs_s = xs[idx_s];
+        ys_s = ys[idx_s];
+        zs_s = zs[idx_s]
+        sc_s = ax_s.scatter(xs_s, ys_s, zs_s, c=zs_s, cmap="jet",
+                            s=6, zorder=3, depthshade=True, alpha=0.85)
+        self._cb3d_surf = self._fig3d.colorbar(sc_s, ax=ax_s, shrink=0.5, pad=0.12)
+        self._cb3d_surf.set_label("Z (mm)", fontsize=8)
+        ax_s.set_title(f"{surface_name} 形状", fontsize=10, color="#1a3f6f", pad=8)
+        ax_s.set_xlabel("X (mm)", fontsize=8, labelpad=4)
+        ax_s.set_ylabel("Y (mm)", fontsize=8, labelpad=4)
+        ax_s.set_zlabel("Z (mm)", fontsize=8, labelpad=4)
+        _set_aspect(ax_s, xs, ys, zs)
+
+        # ── 右图：轨迹路径（密集散点 + 起终点，不画连线避免菱形混乱）──
+        ax_t = self._ax3d_traj
+        ax_t.set_facecolor("#f0f5fc")
+        idx_t = _np.random.choice(len(points), min(10000, len(points)), replace=False)
+        idx_t.sort()
+        xs_t = xs[idx_t];
+        ys_t = ys[idx_t];
+        zs_t = zs[idx_t]
+        sc_t = ax_t.scatter(xs_t, ys_t, zs_t, c=zs_t, cmap="jet",
+                            s=6, zorder=3, depthshade=True, alpha=0.85)
+        ax_t.scatter([xs[0]], [ys[0]], [zs[0]],
+                     s=60, color="#27ae60", zorder=5, marker="^", label="起点")
+        ax_t.scatter([xs[-1]], [ys[-1]], [zs[-1]],
+                     s=60, color="#c0392b", zorder=5, marker="s", label="终点")
+        self._cb3d = self._fig3d.colorbar(sc_t, ax=ax_t, shrink=0.5, pad=0.12)
+        self._cb3d.set_label("Z (mm)  ←蓝低  红高→", fontsize=8)
+        ax_t.set_title(f"{traj_name}  共 {len(points)} 个轨迹点",
+                       fontsize=10, color="#1a3f6f", pad=8)
+        ax_t.set_xlabel("X (mm)", fontsize=8, labelpad=4)
+        ax_t.set_ylabel("Y (mm)", fontsize=8, labelpad=4)
+        ax_t.set_zlabel("Z (mm)", fontsize=8, labelpad=4)
+        ax_t.legend(loc="upper left", fontsize=8, framealpha=0.85)
+        _set_aspect(ax_t, xs, ys, zs)
 
         self._fig3d.tight_layout()
         self._canvas3d.draw()
@@ -275,7 +290,8 @@ class ControlPanel(QStackedWidget):
         self.idx_license = self.count()
         self.addWidget(self._build_license_page())
 
-        # 曲面轨迹：统一入口页（下拉选择 + 子页面）        self.idx_surface = self.count()
+        # 曲面轨迹：统一入口页（下拉选择 + 子页面）
+        self.idx_surface = self.count()
         self.addWidget(self._build_surface_selector_page())
 
         # 当前缓存的轨迹点和参数
@@ -416,7 +432,10 @@ class ControlPanel(QStackedWidget):
     # 共用：轨迹类型子组件（栅形/螺旋线）
     # ────────────────────────────────────────────────────────────────
     def _build_traj_group(self, prefix):
-        """返回 (grp, cmb_type, cmb_dir, edt_step, edt_spacing, edt_pitch, edt_arc)"""
+        """返回 (grp, cmb_type, cmb_dir, edt_step, edt_spacing, edt_pitch, edt_arc)
+        无论栅形还是螺旋线，均只显示「间距」和「步长」两个输入框。
+        默认值：间距=0.8 mm，步长=0.25 mm（固定）。
+        """
         grp = QGroupBox("轨迹参数")
         g   = QVBoxLayout(grp)
 
@@ -424,26 +443,28 @@ class ControlPanel(QStackedWidget):
         cmb_type.addItems(["栅形轨迹 (Raster)", "螺旋线轨迹 (Spiral)"])
         combox_input(g, "轨迹类型：", cmb_type)
 
+        # 隐藏的栅形方向（保留供读取逻辑使用，不再显示）
         cmb_dir = QComboBox()
         cmb_dir.addItems(["平行于 X 轴（沿 Y 推进）", "平行于 Y 轴（沿 X 推进）"])
-        combox_input(g, "栅形方向：", cmb_dir)
+        cmb_dir.setVisible(False)
 
-        edt_step,    row_st  = lineedit_input("点间步长 (mm)：",      "1.0")
-        edt_spacing, row_sp  = lineedit_input("线间距 (mm)：",        "5.0")
-        edt_pitch,   row_pt  = lineedit_input("螺距 (mm/圈)：",       "5.0")
-        edt_arc,     row_arc = lineedit_input("弧长步长 (mm)：",      "1.0")
-        g.addLayout(row_st); g.addLayout(row_sp)
-        g.addLayout(row_pt); g.addLayout(row_arc)
+        # 统一显示：间距（上）、步长（下）
+        edt_spacing, row_sp  = lineedit_input("间距 (mm)：",  "0.8")
+        edt_step,    row_st  = lineedit_input("步长 (mm)：",  "0.25")
+        g.addLayout(row_sp)
+        g.addLayout(row_st)
 
-        def on_type_changed(idx):
-            is_raster = idx == 0
-            cmb_dir.setVisible(is_raster)
-            edt_step.setVisible(is_raster)
-            edt_spacing.setVisible(is_raster)
-            edt_pitch.setVisible(not is_raster)
-            edt_arc.setVisible(not is_raster)
-        cmb_type.currentIndexChanged.connect(on_type_changed)
-        on_type_changed(0)
+        # 保留 pitch/arc 对象供 _read_traj 使用，不显示
+        edt_pitch = QLineEdit("0.8");   edt_pitch.setVisible(False)
+        edt_arc   = QLineEdit("0.25");  edt_arc.setVisible(False)
+
+        def on_spacing_changed(txt):
+            edt_pitch.setText(txt)
+        def on_step_changed(txt):
+            edt_arc.setText(txt)
+
+        edt_spacing.textChanged.connect(on_spacing_changed)
+        edt_step.textChanged.connect(on_step_changed)
 
         return grp, cmb_type, cmb_dir, edt_step, edt_spacing, edt_pitch, edt_arc
 
@@ -1120,11 +1141,11 @@ class ControlPanel(QStackedWidget):
         self.asp_cmb_dir = QComboBox()
         self.asp_cmb_dir.addItems(["X方向 (平行X轴)", "Y方向 (平行Y轴)"])
         combox_input(g5, "栅形方向：", self.asp_cmb_dir)
-        self.asp_edt_step,    row_st  = lineedit_input("步长 (mm)：",    "1.0")
-        self.asp_edt_spacing, row_sp  = lineedit_input("线间距 (mm)：",  "5.0")
-        self.asp_edt_pitch,   row_pit = lineedit_input("螺距 (mm)：",    "5.0")
-        self.asp_edt_arcstep, row_as  = lineedit_input("弧长步长 (mm)：","1.0")
-        for row in [row_st, row_sp, row_pit, row_as]:
+        self.asp_edt_spacing, row_sp  = lineedit_input("间距 (mm)：",   "0.8")
+        self.asp_edt_step,    row_st  = lineedit_input("步长 (mm)：",   "0.25")
+        self.asp_edt_pitch,   row_pit = lineedit_input("间距 (mm)：",   "0.8")
+        self.asp_edt_arcstep, row_as  = lineedit_input("步长 (mm)：",   "0.25")
+        for row in [row_sp, row_st]:
             g5.addLayout(row)
         layout.addWidget(grp5)
 
@@ -1171,10 +1192,11 @@ class ControlPanel(QStackedWidget):
     def _asp_traj_changed(self):
         is_raster = (self.asp_cmb_traj.currentIndex() == 0)
         self.asp_cmb_dir.setVisible(is_raster)
-        self.asp_edt_step.setVisible(is_raster)
-        self.asp_edt_spacing.setVisible(is_raster)
-        self.asp_edt_pitch.setVisible(not is_raster)
-        self.asp_edt_arcstep.setVisible(not is_raster)
+        # 间距/步长始终显示，不随轨迹类型切换
+        self.asp_edt_spacing.setVisible(True)
+        self.asp_edt_step.setVisible(True)
+        self.asp_edt_pitch.setVisible(False)
+        self.asp_edt_arcstep.setVisible(False)
 
     def _do_generate_aspherical(self):
         def f(e, n):
@@ -1196,9 +1218,9 @@ class ControlPanel(QStackedWidget):
             traj  = "G" if self.asp_cmb_traj.currentIndex() == 0 else "S"
             dire  = "X" if self.asp_cmb_dir.currentIndex()  == 0 else "Y"
             step_len     = f(self.asp_edt_step,    "步长")
-            line_spacing = f(self.asp_edt_spacing, "线间距")
-            pitch        = f(self.asp_edt_pitch,   "螺距")
-            arc_step     = f(self.asp_edt_arcstep, "弧长步长")
+            line_spacing = f(self.asp_edt_spacing, "间距")
+            pitch        = line_spacing
+            arc_step     = step_len
             kwargs = dict(R=R, k=k, A4=A4, A6=A6, A8=A8, A10=A10, A12=A12, A14=A14,
                           offcenter=off, traj_type=traj, direction=dire,
                           step_len=step_len, line_spacing=line_spacing,
@@ -1257,11 +1279,11 @@ class ControlPanel(QStackedWidget):
         self.sph_cmb_dir = QComboBox()
         self.sph_cmb_dir.addItems(["X方向 (平行X轴)", "Y方向 (平行Y轴)"])
         combox_input(g2, "栅形方向：", self.sph_cmb_dir)
-        self.sph_edt_step,    row_st  = lineedit_input("步长 (mm)：",    "1.0")
-        self.sph_edt_spacing, row_sp  = lineedit_input("线间距 (mm)：",  "5.0")
-        self.sph_edt_pitch,   row_pit = lineedit_input("螺距 (mm)：",    "5.0")
-        self.sph_edt_arcstep, row_as  = lineedit_input("弧长步长 (mm)：","1.0")
-        for row in [row_st, row_sp, row_pit, row_as]:
+        self.sph_edt_spacing, row_sp  = lineedit_input("间距 (mm)：",   "0.8")
+        self.sph_edt_step,    row_st  = lineedit_input("步长 (mm)：",   "0.25")
+        self.sph_edt_pitch,   row_pit = lineedit_input("间距 (mm)：",   "0.8")
+        self.sph_edt_arcstep, row_as  = lineedit_input("步长 (mm)：",   "0.25")
+        for row in [row_sp, row_st]:
             g2.addLayout(row)
         layout.addWidget(grp2)
 
@@ -1294,10 +1316,10 @@ class ControlPanel(QStackedWidget):
     def _sph_traj_changed(self):
         is_raster = (self.sph_cmb_traj.currentIndex() == 0)
         self.sph_cmb_dir.setVisible(is_raster)
-        self.sph_edt_step.setVisible(is_raster)
-        self.sph_edt_spacing.setVisible(is_raster)
-        self.sph_edt_pitch.setVisible(not is_raster)
-        self.sph_edt_arcstep.setVisible(not is_raster)
+        self.sph_edt_spacing.setVisible(True)
+        self.sph_edt_step.setVisible(True)
+        self.sph_edt_pitch.setVisible(False)
+        self.sph_edt_arcstep.setVisible(False)
 
     def _do_generate_spherical(self):
         def f(e, n):
@@ -1311,9 +1333,9 @@ class ControlPanel(QStackedWidget):
             traj = "G" if self.sph_cmb_traj.currentIndex() == 0 else "S"
             dire = "X" if self.sph_cmb_dir.currentIndex()  == 0 else "Y"
             step_len     = f(self.sph_edt_step,    "步长")
-            line_spacing = f(self.sph_edt_spacing, "线间距")
-            pitch        = f(self.sph_edt_pitch,   "螺距")
-            arc_step     = f(self.sph_edt_arcstep, "弧长步长")
+            line_spacing = f(self.sph_edt_spacing, "间距")
+            pitch        = line_spacing
+            arc_step     = step_len
         except ValueError as e:
             QMessageBox.warning(self._main, "参数错误", str(e)); return
         try:
@@ -1377,11 +1399,11 @@ class ControlPanel(QStackedWidget):
         self.cyl_cmb_dir = QComboBox()
         self.cyl_cmb_dir.addItems(["X方向步进", "Y方向步进"])
         combox_input(g3, "栅形方向：", self.cyl_cmb_dir)
-        self.cyl_edt_step,    row_st  = lineedit_input("步长 (mm)：",    "0.08")
-        self.cyl_edt_spacing, row_sp  = lineedit_input("线间距 (mm)：",  "0.5")
-        self.cyl_edt_pitch,   row_pit = lineedit_input("螺距 (mm)：",    "0.5")
-        self.cyl_edt_arcstep, row_as  = lineedit_input("弧长步长 (mm)：","0.08")
-        for row in [row_st, row_sp, row_pit, row_as]:
+        self.cyl_edt_spacing, row_sp  = lineedit_input("间距 (mm)：",   "0.8")
+        self.cyl_edt_step,    row_st  = lineedit_input("步长 (mm)：",   "0.25")
+        self.cyl_edt_pitch,   row_pit = lineedit_input("间距 (mm)：",   "0.8")
+        self.cyl_edt_arcstep, row_as  = lineedit_input("步长 (mm)：",   "0.25")
+        for row in [row_sp, row_st]:
             g3.addLayout(row)
         layout.addWidget(grp3)
 
@@ -1416,10 +1438,10 @@ class ControlPanel(QStackedWidget):
     def _cyl_traj_changed(self):
         is_raster = (self.cyl_cmb_traj.currentIndex() == 0)
         self.cyl_cmb_dir.setVisible(is_raster)
-        self.cyl_edt_step.setVisible(is_raster)
-        self.cyl_edt_spacing.setVisible(is_raster)
-        self.cyl_edt_pitch.setVisible(not is_raster)
-        self.cyl_edt_arcstep.setVisible(not is_raster)
+        self.cyl_edt_spacing.setVisible(True)
+        self.cyl_edt_step.setVisible(True)
+        self.cyl_edt_pitch.setVisible(False)
+        self.cyl_edt_arcstep.setVisible(False)
 
     def _cyl_proj_changed(self):
         is_circ = (self.cyl_cmb_proj.currentIndex() == 1)
@@ -1442,9 +1464,9 @@ class ControlPanel(QStackedWidget):
             traj  = "G" if self.cyl_cmb_traj.currentIndex() == 0 else "S"
             dire  = "X" if self.cyl_cmb_dir.currentIndex()  == 0 else "Y"
             step_len     = f(self.cyl_edt_step,    "步长")
-            line_spacing = f(self.cyl_edt_spacing, "线间距")
-            pitch        = f(self.cyl_edt_pitch,   "螺距")
-            arc_step     = f(self.cyl_edt_arcstep, "弧长步长")
+            line_spacing = f(self.cyl_edt_spacing, "间距")
+            pitch        = line_spacing
+            arc_step     = step_len
         except ValueError as e:
             QMessageBox.warning(self._main, "参数错误", str(e)); return
         try:
@@ -1523,11 +1545,11 @@ class ControlPanel(QStackedWidget):
         self.con_cmb_dir = QComboBox()
         self.con_cmb_dir.addItems(["X方向 (平行X轴)", "Y方向 (平行Y轴)"])
         combox_input(g3, "栅形方向：", self.con_cmb_dir)
-        self.con_edt_step,    row_st  = lineedit_input("步长 (mm)：",    "1.0")
-        self.con_edt_spacing, row_sp  = lineedit_input("线间距 (mm)：",  "5.0")
-        self.con_edt_pitch,   row_pit = lineedit_input("螺距 (mm)：",    "5.0")
-        self.con_edt_arcstep, row_as  = lineedit_input("弧长步长 (mm)：","1.0")
-        for row in [row_st, row_sp, row_pit, row_as]:
+        self.con_edt_spacing, row_sp  = lineedit_input("间距 (mm)：",   "0.8")
+        self.con_edt_step,    row_st  = lineedit_input("步长 (mm)：",   "0.25")
+        self.con_edt_pitch,   row_pit = lineedit_input("间距 (mm)：",   "0.8")
+        self.con_edt_arcstep, row_as  = lineedit_input("步长 (mm)：",   "0.25")
+        for row in [row_sp, row_st]:
             g3.addLayout(row)
         layout.addWidget(grp3)
 
@@ -1574,10 +1596,10 @@ class ControlPanel(QStackedWidget):
     def _con_traj_changed(self):
         is_raster = (self.con_cmb_traj.currentIndex() == 0)
         self.con_cmb_dir.setVisible(is_raster)
-        self.con_edt_step.setVisible(is_raster)
-        self.con_edt_spacing.setVisible(is_raster)
-        self.con_edt_pitch.setVisible(not is_raster)
-        self.con_edt_arcstep.setVisible(not is_raster)
+        self.con_edt_spacing.setVisible(True)
+        self.con_edt_step.setVisible(True)
+        self.con_edt_pitch.setVisible(False)
+        self.con_edt_arcstep.setVisible(False)
 
     def _do_generate_conical(self):
         def f(e, n):
@@ -1591,9 +1613,9 @@ class ControlPanel(QStackedWidget):
             traj  = "G" if self.con_cmb_traj.currentIndex() == 0 else "S"
             dire  = "X" if self.con_cmb_dir.currentIndex()  == 0 else "Y"
             step_len     = f(self.con_edt_step,    "步长")
-            line_spacing = f(self.con_edt_spacing, "线间距")
-            pitch        = f(self.con_edt_pitch,   "螺距")
-            arc_step     = f(self.con_edt_arcstep, "弧长步长")
+            line_spacing = f(self.con_edt_spacing, "间距")
+            pitch        = line_spacing
+            arc_step     = step_len
             kwargs = dict(cone_type=ctype, alpha_deg=alpha, H=H,
                           cover_type=cover, traj_type=traj, direction=dire,
                           step_len=step_len, line_spacing=line_spacing,
