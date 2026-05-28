@@ -27,8 +27,11 @@ def generate_spherical(R, zc=0.0, surf_type="convex", h=None,
         raise ValueError("投影圆半径为零，请调整 h 值")
 
     if traj_type == "G":
-        p2d = generate_raster_rect(-r_proj, r_proj, -r_proj, r_proj, direction, step_len, line_spacing)
-        p2d = [[x, y] for x, y in p2d if x ** 2 + y ** 2 <= r_proj ** 2 + 1e-6]
+        edge_margin = max(step_len, line_spacing) * 0.5
+        r_traj = max(0.0, r_proj - edge_margin)
+        p2d = generate_raster_rect(-r_traj, r_traj, -r_traj, r_traj,
+                                   direction, step_len, line_spacing)
+        p2d = [[x, y] for x, y in p2d if x ** 2 + y ** 2 <= r_traj ** 2 + 1e-6]
     else:
         p2d = generate_spiral_2d(pitch, arc_step, r_proj, 0.0, 0.0)
         p2d = [[x, y] for x, y in p2d if x ** 2 + y ** 2 <= r_proj ** 2 + 1e-6]

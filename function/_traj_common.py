@@ -7,7 +7,7 @@ def _linspace_inclusive(start, stop, step):
     arr = np.arange(start, stop + 1e-9, step)
     if len(arr) == 0:
         return np.array([start])
-    if arr[-1] < stop - step * 0.01:
+    if arr[-1] < stop and (stop - arr[-1]) > step * 0.5:
         arr = np.append(arr, stop)
     return arr
 
@@ -35,43 +35,22 @@ def generate_raster_rect(x_min, x_max, y_min, y_max, direction, step_len, line_s
 
 
 def generate_raster_circle(xc, yc, R, direction, step_len, line_spacing):
-    """圆形区域内的栅形二维投影点（逐行裁剪，不生成完整矩形再过滤）"""
+    """圆形区域内的栅形二维投影点（先生成外接矩形，再按圆形裁剪）。"""
+    rect_points = generate_raster_rect(
+        xc - R, xc + R, yc - R, yc + R, direction, step_len, line_spacing
+    )
     R2 = R * R + 1e-6
-    points = []
-    if direction == "X":
-        for i, y in enumerate(_linspace_inclusive(yc - R, yc + R, line_spacing)):
-            dy2 = (float(y) - yc) ** 2
-            if dy2 > R2:
-                continue
-            half = np.sqrt(R2 - dy2)
-            xs = _linspace_inclusive(xc - half, xc + half, step_len)
-            if i % 2:
-                xs = xs[::-1]
-            y_f = float(y)
-            for x in xs:
-                if (float(x) - xc) ** 2 + dy2 <= R2:
-                    points.append([float(x), y_f])
-    else:
-        for i, x in enumerate(_linspace_inclusive(xc - R, xc + R, line_spacing)):
-            dx2 = (float(x) - xc) ** 2
-            if dx2 > R2:
-                continue
-            half = np.sqrt(R2 - dx2)
-            ys = _linspace_inclusive(yc - half, yc + half, step_len)
-            if i % 2:
-                ys = ys[::-1]
-            x_f = float(x)
-            for y in ys:
-                if dx2 + (float(y) - yc) ** 2 <= R2:
-                    points.append([x_f, float(y)])
-    return points
+    return [
+        [x, y] for x, y in rect_points
+        if (x - xc) ** 2 + (y - yc) ** 2 <= R2
+    ]
 
 
 def generate_spiral_2d(pitch, arc_step, R_max, xc, yc):
     """等弧长阿基米德螺旋线二维点
-    细分步长固定为 0.002 弧度（工程精度，不自适应）。
+    细分步长固定为 0.005 弧度，与 trajectory 中的 MATLAB 版本一致。
     """
-    DTHETA = 0.05          # 固定细分步长（弧度）
+    DTHETA = 0.005         # 固定细分步长（弧度）
     b = pitch / (2 * np.pi)
     if b <= 0:
         raise ValueError("螺距 pitch 必须为正数")

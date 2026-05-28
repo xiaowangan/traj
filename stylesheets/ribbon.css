@@ -14,7 +14,7 @@ QTabWidget:pane {
 }
 QTabWidget{
         font: 10pt "微软雅黑";
-        background-color:#00001
+        background-color:#dfe9f5
 
 }
 
@@ -31,7 +31,7 @@ QTabBar::tab {
     border-top-right-radius: 3px;
     margin-right:5px;
     color:#2A2A2A;
-    background-color:#00001
+    background-color:#dfe9f5
 
  }
 

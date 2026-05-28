@@ -49,10 +49,14 @@ def generate_cylindrical(R, zc=0.0, k_cut=0.0, axis_dir="Y", surf_type="C",
             xc_sp = (x_min_p + x_max_p) / 2; yc_sp = (y_min_p + y_max_p) / 2
         p2d = generate_spiral_2d(pitch, arc_step, R_sp, xc_sp, yc_sp)
         if proj_shape == "C":
-            p2d = [[x, y] for x, y in p2d if x ** 2 + y ** 2 <= eff_R ** 2 + 1e-6]
+            edge_margin = arc_step * 0.5
+            r_keep = max(0.0, eff_R - edge_margin)
+            p2d = [[x, y] for x, y in p2d if x ** 2 + y ** 2 <= r_keep ** 2 + 1e-6]
         else:
-            p2d = [[x, y] for x, y in p2d if x_min_p - 1e-6 <= x <= x_max_p + 1e-6 and y_min_p - 1e-6 <= y <= y_max_p + 1e-6]
-
+            edge_margin = arc_step * 0.5
+            p2d = [[x, y] for x, y in p2d
+                   if x_min_p + edge_margin <= x <= x_max_p - edge_margin
+                   and y_min_p + edge_margin <= y <= y_max_p - edge_margin]
     if not p2d:
         raise ValueError("未生成任何轨迹点，请检查参数设置")
 

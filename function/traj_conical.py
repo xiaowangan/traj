@@ -42,6 +42,8 @@ def generate_conical(cone_type=1, alpha_deg=30.0, H=50.0,
         R_sp = 0.5 * np.hypot(rect_xmax - rect_xmin, rect_ymax - rect_ymin)
     else:
         if circ_R <= 0: raise ValueError("圆形覆盖半径必须为正数")
+        if np.hypot(circ_xc, circ_yc) + circ_R > R_base + 1e-6:
+            raise ValueError("圆形区域超出底面圆")
         xmn = circ_xc - circ_R; xmx = circ_xc + circ_R
         ymn = circ_yc - circ_R; ymx = circ_yc + circ_R
         xc_sp, yc_sp, R_sp = circ_xc, circ_yc, circ_R
