@@ -35,7 +35,7 @@ def generate_raster_rect(x_min, x_max, y_min, y_max, direction, step_len, line_s
 
 
 def generate_raster_circle(xc, yc, R, direction, step_len, line_spacing):
-    """圆形区域内的栅形二维投影点（先生成外接矩形，再按圆形裁剪）。"""
+    """圆形区域内的栅形二维投影点（与 MATLAB 原版一致：先外接矩形，再按圆域裁剪）。"""
     rect_points = generate_raster_rect(
         xc - R, xc + R, yc - R, yc + R, direction, step_len, line_spacing
     )

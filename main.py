@@ -15,12 +15,7 @@ import os
 # ── 确保 cwd 是软件根目录（stylesheets/ icons/ 的相对路径依赖此）──
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
-import matplotlib
-matplotlib.use("Qt5Agg")
-import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
 import numpy as np
-from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 
 from PyQt5 import QtWidgets, QtGui, QtCore
 from PyQt5.QtWidgets import (
@@ -40,8 +35,9 @@ from GUI.Icons import get_icon
 from GUI.StyleSheets import get_stylesheet
 
 # ── 本模块 ──────────────────────────────────────────────────────────
-from function.planar_trajectory import (generate_planar_raster, generate_planar_spiral,
-    generate_raster, generate_spiral, save_trajectory_txt)
+from function.planar_trajectory import (
+    generate_planar_raster, generate_planar_spiral, save_trajectory_txt
+)
 from function.surface_trajectory import (
     generate_aspherical, generate_spherical,
     generate_cylindrical, generate_conical,
@@ -49,7 +45,6 @@ from function.surface_trajectory import (
 )
 from function.license_manager   import get_hardware_id, activate, verify_license
 
-plt.rcParams['font.family'] = ['Microsoft YaHei', 'SimHei', 'DejaVu Sans']
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -85,433 +80,684 @@ class PreviewCanvas(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setStyleSheet("background-color: #dfe9f5;")
+        self._occ_error = None
+
         outer = QVBoxLayout(self)
         outer.setContentsMargins(6, 6, 6, 6)
-
-        # ── 两个独立画布，用 QStackedWidget 切换（平面2D / 曲面双3D） ──
         self._stack = QStackedWidget()
         outer.addWidget(self._stack)
 
-        # ── 画布 0：平面轨迹（2D 单图） ──
-        self._fig2d, self._ax2d = plt.subplots(figsize=(7, 6), dpi=96)
-        self._fig2d.patch.set_facecolor("#dfe9f5")
-        self._ax2d.set_facecolor("#f0f5fc")
-        canvas2d = FigureCanvas(self._fig2d)
-        canvas2d.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        w2d = QWidget(); l2d = QVBoxLayout(w2d); l2d.setContentsMargins(0,0,0,0)
-        l2d.addWidget(canvas2d)
-        self._stack.addWidget(w2d)   # idx 0
-        self._canvas2d = canvas2d
+        self._display2d = None
+        self._display_surf = None
+        self._display_traj = None
+        self._viewer2d = None
+        self._viewer_surf = None
+        self._viewer_traj = None
+        self._display_viewers = {}
+        self._label2d = None
+        self._label_surf = None
+        self._label_traj = None
+        self._label_hosts = []
 
-        # ── 画布 1：曲面轨迹（左=曲面形状，右=轨迹，并排 3D，PyVista） ──
-        from pyvistaqt import QtInteractor
-        w3d = QWidget()
-        l3d = QHBoxLayout(w3d)
-        l3d.setContentsMargins(0, 0, 0, 0)
-        l3d.setSpacing(2)
-        # 左：曲面形状
-        self._pv_surf = QtInteractor(w3d)
-        self._pv_surf.set_background("#dfe9f5")
-        l3d.addWidget(self._pv_surf)
-        # 右：轨迹路径
-        self._pv_traj = QtInteractor(w3d)
-        self._pv_traj.set_background("#dfe9f5")
-        l3d.addWidget(self._pv_traj)
-        self._stack.addWidget(w3d)   # idx 1
+        self._init_occ_widgets()
 
-        # 初始显示 2D 空白提示
-        self._ax2d.set_title("（尚未生成轨迹）", fontsize=11, color="#888888")
-        self._ax2d.axis("off")
-        self._canvas2d.draw()
-        self._stack.setCurrentIndex(0)
+    def _init_occ_widgets(self):
+        try:
+            self._occ_imports()
+            self._viewer2d, self._display2d = self._make_viewer()
+            page2d = QWidget()
+            lay2d = QVBoxLayout(page2d)
+            lay2d.setContentsMargins(0, 0, 0, 0)
+            lay2d.addWidget(self._viewer2d)
+            self._label2d = self._make_overlay_label(page2d)
+            self._stack.addWidget(page2d)
 
-    def close_pyvista(self):
-        for plotter in (getattr(self, "_pv_surf", None), getattr(self, "_pv_traj", None)):
-            if plotter is None:
+            page3d = QWidget()
+            lay3d = QHBoxLayout(page3d)
+            lay3d.setContentsMargins(0, 0, 0, 0)
+            lay3d.setSpacing(2)
+            surf_box = QWidget(page3d)
+            surf_layout = QVBoxLayout(surf_box)
+            surf_layout.setContentsMargins(0, 0, 0, 0)
+            self._viewer_surf, self._display_surf = self._make_viewer()
+            surf_layout.addWidget(self._viewer_surf)
+            self._label_surf = self._make_overlay_label(surf_box)
+
+            traj_box = QWidget(page3d)
+            traj_layout = QVBoxLayout(traj_box)
+            traj_layout.setContentsMargins(0, 0, 0, 0)
+            self._viewer_traj, self._display_traj = self._make_viewer()
+            traj_layout.addWidget(self._viewer_traj)
+            self._label_traj = self._make_overlay_label(traj_box)
+
+            lay3d.addWidget(surf_box)
+            lay3d.addWidget(traj_box)
+            self._stack.addWidget(page3d)
+
+            self._stack.setCurrentIndex(0)
+            QtCore.QTimer.singleShot(0, self._sync_all_occ_views)
+            QtCore.QTimer.singleShot(200, self._sync_all_occ_views)
+        except Exception as exc:
+            self._occ_error = exc
+            label = QLabel(
+                "OCC viewer initialization failed. Install pythonocc-core "
+                f"in the current environment, then restart the software.\n\n{exc}"
+            )
+            label.setAlignment(Qt.AlignCenter)
+            label.setWordWrap(True)
+            label.setStyleSheet("color:#c0392b; font-size:14px; background:#dfe9f5;")
+            self._stack.addWidget(label)
+            self._stack.setCurrentIndex(0)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._place_overlay_labels()
+        if self._occ_error is None:
+            QtCore.QTimer.singleShot(0, self._sync_all_occ_views)
+
+    def _make_overlay_label(self, host):
+        label = QLabel(host)
+        label.setAlignment(Qt.AlignCenter)
+        label.setStyleSheet(
+            "QLabel {"
+            "background-color: #d6e2f0;"
+            "color: #10243f;"
+            "font-family: Microsoft YaHei, SimHei, Arial;"
+            "font-size: 13px;"
+            "font-weight: 700;"
+            "padding: 3px 8px;"
+            "border-bottom: 1px solid #b8c7d8;"
+            "}"
+        )
+        label.hide()
+        self._label_hosts.append((host, label))
+        return label
+
+    def _set_label(self, label, text):
+        if label is None:
+            return
+        label.setText(text)
+        label.show()
+        label.raise_()
+        self._place_overlay_labels()
+
+    def _place_overlay_labels(self):
+        for host, label in self._label_hosts:
+            if host is None or label is None:
                 continue
+            label.setGeometry(0, 0, max(1, host.width()), 30)
+            label.raise_()
+
+    def _sync_all_occ_views(self):
+        for display in (self._display2d, self._display_surf, self._display_traj):
+            if display is not None:
+                self._sync_occ_view(display)
+                try:
+                    display.Repaint()
+                except Exception:
+                    pass
+
+    @staticmethod
+    def _occ_imports():
+        from OCC.Display.backend import load_backend
+        try:
+            load_backend("pyqt5")
+        except Exception:
+            load_backend("qt-pyqt5")
+        from OCC.Display.qtDisplay import qtViewer3d
+        from OCC.Core.BRep import BRep_Builder
+        from OCC.Core.BRepBuilderAPI import (
+            BRepBuilderAPI_MakeEdge,
+            BRepBuilderAPI_MakeFace,
+            BRepBuilderAPI_MakePolygon,
+            BRepBuilderAPI_MakeVertex,
+        )
+        from OCC.Core.BRepPrimAPI import BRepPrimAPI_MakeSphere
+        from OCC.Core.gp import gp_Pnt
+        from OCC.Core.Quantity import Quantity_Color, Quantity_TOC_RGB
+        from OCC.Core.TopoDS import TopoDS_Compound
+        return {
+            "qtViewer3d": qtViewer3d,
+            "BRep_Builder": BRep_Builder,
+            "BRepBuilderAPI_MakeEdge": BRepBuilderAPI_MakeEdge,
+            "BRepBuilderAPI_MakeFace": BRepBuilderAPI_MakeFace,
+            "BRepBuilderAPI_MakePolygon": BRepBuilderAPI_MakePolygon,
+            "BRepBuilderAPI_MakeVertex": BRepBuilderAPI_MakeVertex,
+            "BRepPrimAPI_MakeSphere": BRepPrimAPI_MakeSphere,
+            "gp_Pnt": gp_Pnt,
+            "Quantity_Color": Quantity_Color,
+            "Quantity_TOC_RGB": Quantity_TOC_RGB,
+            "TopoDS_Compound": TopoDS_Compound,
+        }
+
+    def _make_viewer(self):
+        occ = self._occ_imports()
+        viewer = occ["qtViewer3d"](self)
+        viewer.setMinimumSize(120, 120)
+        viewer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        viewer.InitDriver()
+        viewer.qApp = QApplication.instance()
+        display = viewer._display
+        self._display_viewers[id(display)] = viewer
+        try:
+            display.set_bg_gradient_color([188, 205, 224], [223, 233, 245])
+        except Exception:
+            pass
+        return viewer, display
+
+    def _clear_display(self, display):
+        if display is None:
+            return
+        try:
+            display.Context.EraseAll(True)
+        except Exception:
             try:
-                plotter.close()
+                display.EraseAll()
             except Exception:
                 pass
 
-    # ── 平面轨迹：2D 画布 ──────────────────────────────────────────
-    def plot(self, points, params):
-        self._stack.setCurrentIndex(0)
-        ax = self._ax2d
-        ax.clear()
-        ax.set_facecolor("#f0f5fc")
-        ax.grid(True, color="#c8d8ee", linewidth=0.6, linestyle="--")
-        ax.set_aspect("equal")
-        ax.tick_params(labelsize=9)
-
-        if not points:
-            ax.set_title("未生成任何轨迹点", fontsize=11, color="#c0392b")
-            self._canvas2d.draw()
+    def _show_hint(self, display, text):
+        if display is None:
             return
+        if display is self._display2d:
+            self._set_label(self._label2d, text)
+        elif display is self._display_surf:
+            self._set_label(self._label_surf, text)
+        elif display is self._display_traj:
+            self._set_label(self._label_traj, text)
 
-        import numpy as _np
-        xs = _np.array([p[0] for p in points], dtype=float)
-        ys = _np.array([p[1] for p in points], dtype=float)
-        shape = params.get("shape", "R")
-
-        if shape == "R":
-            A, B = params.get("rect_A", 0), params.get("rect_B", 0)
-            ax.add_patch(mpatches.Rectangle((-A/2, -B/2), A, B,
-                lw=1.5, edgecolor="#1a3f6f", facecolor="none",
-                linestyle="--", label="形状边界"))
-        else:
-            R = params.get("circle_R", 0)
-            ax.add_patch(mpatches.Circle((0, 0), R,
-                lw=1.5, edgecolor="#1a3f6f", facecolor="none",
-                linestyle="--", label="形状边界"))
-
-        if params.get("traj_type") == "G" and params.get("cover_type") == 2:
-            x0, y0 = params.get("sub_x0", 0), params.get("sub_y0", 0)
-            C,  D  = params.get("sub_C",  0), params.get("sub_D",  0)
-            ax.add_patch(mpatches.Rectangle((x0, y0), C, D,
-                lw=1, edgecolor="#e67e22", facecolor="none",
-                linestyle=":", label="子区域"))
-
-        MAX_DISPLAY_2D = 80000
-        n_pts = len(xs)
-        if n_pts > MAX_DISPLAY_2D:
-            stride = int(_np.ceil(n_pts / MAX_DISPLAY_2D))
-            idx_d = _np.arange(0, n_pts, stride)
-            xs_d = xs[idx_d]
-            ys_d = ys[idx_d]
-        else:
-            xs_d, ys_d = xs, ys
-
-        s_size = 7 if len(xs_d) <= 20000 else (4 if len(xs_d) <= 50000 else 2)
-        ax.plot(xs_d, ys_d, "-", color="#2563b0", lw=0.8, alpha=0.75, label="轨迹路径")
-        disp_label = f"轨迹点({n_pts})" if n_pts == len(xs_d) else f"轨迹点({n_pts}, 显示{len(xs_d)})"
-        ax.scatter(xs_d, ys_d, s=s_size, color="#1a3f6f", zorder=3, label=disp_label)
-        ax.scatter([xs[0]],  [ys[0]],  s=60, color="#27ae60",
-                   zorder=5, marker="^", label="起点")
-        ax.scatter([xs[-1]], [ys[-1]], s=60, color="#c0392b",
-                   zorder=5, marker="s", label="终点")
-
-        tname = "栅形" if params.get("traj_type") == "G" else "螺旋线"
-        sname = "矩形" if shape == "R" else "圆形"
-        ax.set_title(f"{sname} · {tname}轨迹  共 {len(points)} 个轨迹点",
-                     fontsize=11, color="#1a3f6f", pad=8)
-        ax.set_xlabel("X (mm)", fontsize=9)
-        ax.set_ylabel("Y (mm)", fontsize=9)
-        ax.legend(loc="upper right", fontsize=8, framealpha=0.85)
-        self._fig2d.tight_layout()
-        self._canvas2d.draw()
-
-    # ── 曲面轨迹：左=曲面形状，右=轨迹路径（并排 3D 双视图，PyVista） ──
-    def plot_surface(self, points, params):
-        self._stack.setCurrentIndex(1)
-
-        import numpy as _np
-        import pyvista as pv
-
-        # 清空两个 plotter
-        self._pv_surf.clear()
-        self._pv_traj.clear()
-        self._pv_surf.set_background("#dfe9f5")
-        self._pv_traj.set_background("#dfe9f5")
-
-        if not points:
-            self._pv_traj.add_text("未生成任何轨迹点", font_size=12, color="red")
-            self._pv_traj.render()
+    def _display_text(self, display, text, point):
+        if display is None:
             return
+        occ = self._occ_imports()
+        try:
+            display.DisplayMessage(
+                occ["gp_Pnt"](float(point[0]), float(point[1]), float(point[2])),
+                str(text),
+            )
+        except Exception:
+            pass
 
-        xs = _np.array([p[0] for p in points], dtype=float)
-        ys = _np.array([p[1] for p in points], dtype=float)
-        zs = _np.array([p[2] for p in points], dtype=float)
+    def _label_anchor(self, points):
+        if not points:
+            return (0, 0, 0)
+        arr = np.array([[p[0], p[1], p[2]] for p in points], dtype=float)
+        mins = np.nanmin(arr, axis=0)
+        maxs = np.nanmax(arr, axis=0)
+        span = np.maximum(maxs - mins, 1.0)
+        return (
+            mins[0] + span[0] * 0.02,
+            maxs[1] - span[1] * 0.06,
+            maxs[2] + span[2] * 0.10 + 0.5,
+        )
 
-        surface_name = params.get("surface_name", "曲面")
-        traj_name    = params.get("traj_name", "")
-        n_pts = len(points)
+    def _make_compound(self, shapes):
+        occ = self._occ_imports()
+        compound = occ["TopoDS_Compound"]()
+        builder = occ["BRep_Builder"]()
+        builder.MakeCompound(compound)
+        for shape in shapes:
+            if shape is not None:
+                builder.Add(compound, shape)
+        return compound
 
-        # ── 左图：曲面几何（surface mesh，回退散点云）──────────────────
-        geom = params.get("geom")
-        rendered = False
-        if geom is not None:
+    def _point_shape(self, x, y, z):
+        occ = self._occ_imports()
+        return occ["BRepBuilderAPI_MakeVertex"](occ["gp_Pnt"](float(x), float(y), float(z))).Vertex()
+
+    def _edge_shape(self, p1, p2):
+        if np.linalg.norm(np.array(p1, dtype=float) - np.array(p2, dtype=float)) < 1e-9:
+            return None
+        occ = self._occ_imports()
+        gp_Pnt = occ["gp_Pnt"]
+        edge_builder = occ["BRepBuilderAPI_MakeEdge"](
+            gp_Pnt(float(p1[0]), float(p1[1]), float(p1[2])),
+            gp_Pnt(float(p2[0]), float(p2[1]), float(p2[2])),
+        )
+        try:
+            return edge_builder.Edge()
+        except RuntimeError:
+            return None
+
+    def _sphere_shape(self, point, radius):
+        occ = self._occ_imports()
+        gp_Pnt = occ["gp_Pnt"]
+        return occ["BRepPrimAPI_MakeSphere"](
+            gp_Pnt(float(point[0]), float(point[1]), float(point[2])), float(radius)
+        ).Shape()
+
+    def _face_shape(self, pts):
+        arr = np.array(pts, dtype=float)
+        if not np.isfinite(arr).all():
+            return None
+        unique = []
+        for p in arr:
+            if not any(np.linalg.norm(p - q) < 1e-8 for q in unique):
+                unique.append(p)
+        if len(unique) < 3:
+            return None
+        unique = unique[:3]
+        tri = np.array(unique, dtype=float)
+        area = np.linalg.norm(np.cross(tri[1] - tri[0], tri[2] - tri[0]))
+        if area < 1e-8:
+            return None
+        occ = self._occ_imports()
+        gp_Pnt = occ["gp_Pnt"]
+        polygon = occ["BRepBuilderAPI_MakePolygon"]()
+        for p in tri:
+            polygon.Add(gp_Pnt(float(p[0]), float(p[1]), float(p[2])))
+        polygon.Close()
+        try:
+            return occ["BRepBuilderAPI_MakeFace"](polygon.Wire()).Face()
+        except Exception:
+            return None
+
+    def _display_shapes(self, display, shapes, color=None, update=False):
+        if not shapes:
+            return
+        compound = self._make_compound(shapes)
+        display_color = self._occ_color(color)
+        displayed = None
+        try:
+            displayed = display.DisplayShape(compound, color=display_color, update=update)
+        except TypeError:
             try:
-                rendered = self._render_surface_from_geom_pv(self._pv_surf, geom)
-            except Exception as _e:
-                print("[plot_surface] PyVista 几何渲染失败，回退到散点：", _e)
+                displayed = display.DisplayShape(compound, update=update)
+            except Exception:
+                pass
+        except Exception:
+            pass
+        try:
+            ais_items = displayed if isinstance(displayed, (list, tuple)) else [displayed]
+            for ais in ais_items:
+                if ais is not None:
+                    display.Context.SetDisplayMode(ais, 1, False)
+                    if display_color is not None and not isinstance(display_color, str):
+                        display.Context.SetColor(ais, display_color, False)
+            display.Context.UpdateCurrentViewer()
+        except Exception:
+            pass
 
-        if not rendered:
-            MAX_DISPLAY = 500000
-            stride = max(1, int(_np.ceil(n_pts / MAX_DISPLAY)))
-            idx_s = _np.arange(0, n_pts, stride)
-            pts_s = _np.column_stack((xs[idx_s], ys[idx_s], zs[idx_s]))
-            cloud_s = pv.PolyData(pts_s)
-            cloud_s["Z (mm)"] = zs[idx_s]
-            self._pv_surf.add_mesh(cloud_s, scalars="Z (mm)", cmap="jet",
-                                   point_size=3, render_points_as_spheres=False,
-                                   scalar_bar_args={"title": "Z (mm)", "fmt": "%.2f"})
+    def _occ_color(self, color):
+        if color is None or isinstance(color, str):
+            return color
+        try:
+            r, g, b = color
+            occ = self._occ_imports()
+            return occ["Quantity_Color"](float(r), float(g), float(b), occ["Quantity_TOC_RGB"])
+        except Exception:
+            return color
 
-        self._pv_surf.add_text(f"{surface_name} 形状", font_size=9, color="#1a3f6f",
-                               position="upper_edge")
-        self._pv_surf.show_axes()
-        self._pv_surf.reset_camera()
-        self._pv_surf.render()
-
-        # ── 右图：轨迹路径散点 + 起终点 ────────────────────────────────
-        MAX_DISPLAY = 500000
-        stride = max(1, int(_np.ceil(n_pts / MAX_DISPLAY)))
-        idx_t = _np.arange(0, n_pts, stride)
-        pts_t = _np.column_stack((xs[idx_t], ys[idx_t], zs[idx_t]))
-        cloud_t = pv.PolyData(pts_t)
-        cloud_t["Z (mm)"] = zs[idx_t]
-        self._pv_traj.add_mesh(cloud_t, scalars="Z (mm)", cmap="jet",
-                               point_size=3, render_points_as_spheres=False,
-                               scalar_bar_args={"title": "Z (mm)  ←蓝低  红高→",
-                                                "fmt": "%.2f"})
-
-        # 起点（绿色球）、终点（红色球）
-        r_marker = max((xs.max()-xs.min()), (ys.max()-ys.min()),
-                       (zs.max()-zs.min())) * 0.012 + 1e-6
-        start_sphere = pv.Sphere(radius=r_marker, center=(xs[0],  ys[0],  zs[0]))
-        end_sphere   = pv.Sphere(radius=r_marker, center=(xs[-1], ys[-1], zs[-1]))
-        self._pv_traj.add_mesh(start_sphere, color="#27ae60", label="起点")
-        self._pv_traj.add_mesh(end_sphere,   color="#c0392b", label="终点")
-
-        #label_suffix = "" if n_pts == len(idx_t) else f"，显示 {len(idx_t)}"
-        #self._pv_traj.add_text(
-        #    f"{traj_name}  共 {n_pts} 个轨迹点{label_suffix}",
-        #    font_size=9, color="#1a3f6f", position="upper_edge")
-        # 把中文去掉，只保留数字信息
-        label = f"pts: {n_pts}" if n_pts == len(idx_t) else f"pts: {n_pts}  shown: {len(idx_t)}"
-        self._pv_traj.add_text(label, font_size=9, position="upper_edge")
-        self._pv_traj.show_axes()
-        self._pv_traj.reset_camera()
-        self._pv_traj.render()
-
-    # ────────────────────────────────────────────────────────────────
-    # 根据几何参数渲染实体曲面（球面 / 非球面 / 柱面 / 锥面）—— PyVista 版
-    # geom 字典格式约定（由各 _do_generate_xxx 注入）：
-    #   {"type": "spherical",  "R":..., "zc":..., "h":..., "surf_type":"convex"/"concave"}
-    #   {"type": "aspherical", "R":..., "k":..., "A4..A14":..., "offcenter":...,
-    #                          "bound_type":1/2/3, "full_width":..., "full_length":...,
-    #                          "rect_xmin/xmax/ymin/ymax":..., "circ_R/xc/yc":...}
-    #   {"type": "cylindrical","R":..., "zc":..., "k_cut":..., "axis_dir":"X"/"Y",
-    #                          "surf_type":"C"/"V", "axis_min/max":...,
-    #                          "proj_shape":"R"/"C", "proj_R":...}
-    #   {"type": "conical",    "cone_type":1/2, "alpha_deg":..., "H":...,
-    #                          "cover_type":1/2/3, ...}
-    # 返回值：True 成功，False/None 失败（调用方回退到散点云）
-    # ────────────────────────────────────────────────────────────────
-    def _render_surface_from_geom_pv(self, plotter, geom):
-        import numpy as _np
-
-        kind = geom.get("type", "")
-
-        # ====================== 球面 ======================
-        if kind == "spherical":
-            R = float(geom["R"]); zc = float(geom.get("zc", 0.0))
-            h = float(geom["h"]); st = geom.get("surf_type", "convex")
-            # 构造在投影圆 r_proj 上的极坐标网格
-            if st == "convex":
-                z_cut = zc + R - h
-                r_proj = _np.sqrt(max(0.0, R*R - (z_cut - zc)**2))
-                z0 = z_cut  # 用于将 Z 平移到从 0 起
-                sign = +1
+    def _fit_display(self, display, view="iso"):
+        if display is None:
+            return
+        self._sync_occ_view(display)
+        try:
+            if view == "top":
+                display.View_Top()
             else:
-                z_cut = zc - R
-                z_top = z_cut + h
-                r_proj = _np.sqrt(max(0.0, R*R - (z_top - zc)**2))
-                z0 = z_cut
-                sign = -1
-            if r_proj < 1e-9:
-                return False
-            n_u, n_v = 80, 60
-            u = _np.linspace(0.0, 2*_np.pi, n_u)
-            v = _np.linspace(0.0, r_proj,   n_v)
-            U, V = _np.meshgrid(u, v)
-            X = V * _np.cos(U)
-            Y = V * _np.sin(U)
-            r2 = X*X + Y*Y
-            sq = _np.sqrt(_np.maximum(0.0, R*R - r2))
-            Z_abs = zc + sign * sq
-            Z = Z_abs - z0  # 与轨迹的 z_rel 对齐
-            return self._draw_jet_surface_pv(plotter, X, Y, Z)
+                display.View_Iso()
+        except Exception:
+            pass
+        try:
+            display.FitAll()
+        except Exception:
+            pass
+        try:
+            display.Repaint()
+        except Exception:
+            pass
+        self._place_overlay_labels()
 
-        # ====================== 非球面 ======================
-        if kind == "aspherical":
-            R   = float(geom["R"]);  k = float(geom.get("k", 0.0))
-            A4  = float(geom.get("A4",  0.0)); A6  = float(geom.get("A6",  0.0))
-            A8  = float(geom.get("A8",  0.0)); A10 = float(geom.get("A10", 0.0))
-            A12 = float(geom.get("A12", 0.0)); A14 = float(geom.get("A14", 0.0))
-            off = float(geom.get("offcenter", 0.0))
-            bt  = int(geom.get("bound_type", 1))
-            if R == 0:
-                return False
-            C = -1.0 / R
+    def _sync_occ_view(self, display):
+        viewer = self._display_viewers.get(id(display))
+        if viewer is not None:
+            try:
+                viewer.show()
+                viewer.resize(max(1, viewer.width()), max(1, viewer.height()))
+                viewer.updateGeometry()
+                viewer.update()
+            except Exception:
+                pass
+            try:
+                display.OnResize()
+            except Exception:
+                pass
+        try:
+            display.View.MustBeResized()
+        except Exception:
+            try:
+                display.GetView().MustBeResized()
+            except Exception:
+                pass
+        try:
+            display.Context.UpdateCurrentViewer()
+        except Exception:
+            pass
 
-            def asp_z(x, y):
-                ys = y - off
-                r2 = x*x + ys*ys
-                under = 1.0 - (1.0 + k) * C*C * r2
-                sq = _np.sqrt(_np.maximum(0.0, under))
-                denom = 1.0 + sq
-                Z = (C * r2) / denom + (A4*r2**2 + A6*r2**3 + A8*r2**4 +
-                                         A10*r2**5 + A12*r2**6 + A14*r2**7)
-                return Z
+    def _trajectory_shapes(self, points, max_points=60000, max_edges=60000, break_long_edges=False):
+        if not points:
+            return [], []
+        n_pts = len(points)
+        stride_pts = max(1, int(np.ceil(n_pts / max_points)))
+        pts = [points[i] for i in range(0, n_pts, stride_pts)]
+        point_shapes = [self._point_shape(p[0], p[1], p[2]) for p in pts]
 
-            if bt == 1:
-                W = float(geom.get("full_width", 0.0))
-                L = float(geom.get("full_length", 0.0))
-                if W <= 0 or L <= 0: return False
-                xs_g = _np.linspace(-W/2, W/2, 80)
-                ys_g = _np.linspace(-L/2, L/2, 80)
-                X, Y = _np.meshgrid(xs_g, ys_g)
-                Z = asp_z(X, Y)
-                return self._draw_jet_surface_pv(plotter, X, Y, Z)
-            elif bt == 2:
-                xmn = float(geom["rect_xmin"]); xmx = float(geom["rect_xmax"])
-                ymn = float(geom["rect_ymin"]); ymx = float(geom["rect_ymax"])
-                xs_g = _np.linspace(xmn, xmx, 80)
-                ys_g = _np.linspace(ymn, ymx, 80)
-                X, Y = _np.meshgrid(xs_g, ys_g)
-                Z = asp_z(X, Y)
-                return self._draw_jet_surface_pv(plotter, X, Y, Z)
-            else:
-                cR  = float(geom["circ_R"])
-                cxc = float(geom.get("circ_xc", 0.0))
-                cyc = float(geom.get("circ_yc", 0.0))
-                if cR <= 0: return False
-                u = _np.linspace(0.0, 2*_np.pi, 80)
-                v = _np.linspace(0.0, cR,       60)
-                U, V = _np.meshgrid(u, v)
-                X = cxc + V*_np.cos(U)
-                Y = cyc + V*_np.sin(U)
-                Z = asp_z(X, Y)
-                return self._draw_jet_surface_pv(plotter, X, Y, Z)
-
-        # ====================== 柱面 ======================
-        if kind == "cylindrical":
-            R    = float(geom["R"])
-            zc   = float(geom.get("zc", 0.0))
-            kcut = float(geom.get("k_cut", zc - R))
-            axis_dir = geom.get("axis_dir", "Y")
-            st   = geom.get("surf_type", "C")  # C 凸, V 凹
-            amin = float(geom["axis_min"]); amax = float(geom["axis_max"])
-            proj = geom.get("proj_shape", "R")
-            proj_R = float(geom.get("proj_R", 0.0))
-
-            delta_z = kcut - zc
-            if abs(delta_z) > R: return False
-            d_max = _np.sqrt(R*R - delta_z*delta_z)
-            z0 = kcut if st == "C" else (zc - R)
-            sign = +1 if st == "C" else -1
-
-            n_axis, n_arc = 60, 80
-            t_axis = _np.linspace(amin, amax, n_axis)
-            d_eff = min(proj_R, d_max) if proj == "C" else d_max
-            d_grid = _np.linspace(-d_eff, d_eff, n_arc)
-
-            T, D = _np.meshgrid(t_axis, d_grid)
-            sq = _np.sqrt(_np.maximum(0.0, R*R - D*D))
-            Z_abs = zc + sign * sq
-
-            if axis_dir == "Y":
-                X = D
-                Y = T
-            else:
-                X = T
-                Y = D
-
-            if proj == "C" and proj_R > 0:
-                if axis_dir == "Y":
-                    mask = (X*X + (Y - 0.5*(amin+amax))**2) <= proj_R**2 + 1e-6
-                else:
-                    mask = ((X - 0.5*(amin+amax))**2 + Y*Y) <= proj_R**2 + 1e-6
-                Z_abs = _np.where(mask, Z_abs, _np.nan)
-
-            Z = Z_abs - z0
-            return self._draw_jet_surface_pv(plotter, X, Y, Z)
-
-        # ====================== 锥面 ======================
-        if kind == "conical":
-            ctype = int(geom.get("cone_type", 1))     # 1 凸, 2 凹
-            alpha = float(geom["alpha_deg"]) * _np.pi / 180.0
-            H     = float(geom["H"])
-            cover = int(geom.get("cover_type", 1))
-            tan_a = _np.tan(alpha)
-            R_base = H * tan_a
-            if R_base <= 0: return False
-
-            def z_cone_arr(r):
-                if ctype == 1:
-                    return H - r/tan_a
-                return r/tan_a
-
-            if cover == 1:
-                u = _np.linspace(0.0, 2*_np.pi, 90)
-                v = _np.linspace(0.0, R_base,   60)
-                U, V = _np.meshgrid(u, v)
-                X = V*_np.cos(U); Y = V*_np.sin(U)
-                R = _np.hypot(X, Y)
-                Z = z_cone_arr(R)
-                return self._draw_jet_surface_pv(plotter, X, Y, Z)
-            elif cover == 2:
-                xmn = float(geom["rect_xmin"]); xmx = float(geom["rect_xmax"])
-                ymn = float(geom["rect_ymin"]); ymx = float(geom["rect_ymax"])
-                xs_g = _np.linspace(xmn, xmx, 80)
-                ys_g = _np.linspace(ymn, ymx, 80)
-                X, Y = _np.meshgrid(xs_g, ys_g)
-                R = _np.hypot(X, Y)
-                Z = z_cone_arr(R)
-                Z = _np.where(R <= R_base + 1e-6, Z, _np.nan)
-                return self._draw_jet_surface_pv(plotter, X, Y, Z)
-            else:
-                cR  = float(geom["circ_R"])
-                cxc = float(geom.get("circ_xc", 0.0))
-                cyc = float(geom.get("circ_yc", 0.0))
-                if cR <= 0: return False
-                u = _np.linspace(0.0, 2*_np.pi, 90)
-                v = _np.linspace(0.0, cR,       60)
-                U, V = _np.meshgrid(u, v)
-                X = cxc + V*_np.cos(U); Y = cyc + V*_np.sin(U)
-                R = _np.hypot(X, Y)
-                Z = z_cone_arr(R)
-                Z = _np.where(R <= R_base + 1e-6, Z, _np.nan)
-                return self._draw_jet_surface_pv(plotter, X, Y, Z)
-
-        # 不支持的类型
-        return False
+        edge_shapes = []
+        if n_pts > 1 and max_edges > 0:
+            stride_edges = max(1, int(np.ceil((n_pts - 1) / max_edges)))
+            line_pts = [points[i] for i in range(0, n_pts, stride_edges)]
+            if line_pts[-1] is not points[-1]:
+                line_pts.append(points[-1])
+            break_limit = self._trajectory_break_limit(line_pts) if break_long_edges else None
+            for p1, p2 in zip(line_pts, line_pts[1:]):
+                if break_limit is not None:
+                    dist = np.linalg.norm(np.array(p1[:3], dtype=float) - np.array(p2[:3], dtype=float))
+                    if dist > break_limit:
+                        continue
+                edge_shapes.append(self._edge_shape(p1, p2))
+        return point_shapes, edge_shapes
 
     @staticmethod
-    def _draw_jet_surface_pv(plotter, X, Y, Z):
-        """以 jet 配色通过 PyVista 绘制结构化曲面网格，返回 True 表示成功。"""
-        import numpy as _np
-        import pyvista as pv
+    def _should_break_long_edges(params):
+        traj_name = str(params.get("traj_name", ""))
+        return params.get("traj_type") == "S" or "螺旋" in traj_name or "Spiral" in traj_name
 
-        # 将 NaN 区域丢弃：先展平，过滤掉含 NaN 的行，再重建点云 + 面片
-        nr, nc = X.shape
-        pts_flat = _np.column_stack((X.ravel(), Y.ravel(), Z.ravel()))
-        valid = _np.isfinite(pts_flat).all(axis=1)
-        if valid.sum() == 0:
-            return False
+    def _trajectory_break_limit(self, points):
+        if len(points) < 4:
+            return None
+        arr = np.array([[p[0], p[1], p[2]] for p in points], dtype=float)
+        dists = np.linalg.norm(np.diff(arr, axis=0), axis=1)
+        dists = dists[np.isfinite(dists) & (dists > 1e-9)]
+        if len(dists) < 3:
+            return None
+        med = float(np.median(dists))
+        p95 = float(np.percentile(dists, 95))
+        return max(med * 5.0, p95 * 2.0, 1e-6)
 
-        # 用 StructuredGrid（忽略 NaN 单元格方式：先建 grid，再 threshold 去掉无效格）
-        grid = pv.StructuredGrid()
-        grid.points = _np.column_stack((X.ravel(), Y.ravel(),
-                                        _np.nan_to_num(Z.ravel(), nan=0.0)))
-        grid.dimensions = (nc, nr, 1)
-        grid["Z (mm)"] = _np.nan_to_num(Z.ravel(), nan=float("nan"))
+    def _marker_radius(self, points):
+        arr = np.array([[p[0], p[1], p[2]] for p in points], dtype=float)
+        span = np.nanmax(arr, axis=0) - np.nanmin(arr, axis=0)
+        return max(float(np.nanmax(span)) * 0.015, 0.4)
 
-        # threshold 掉 NaN 单元（PyVista 会自动按 scalars 过滤）
+    def _draw_scene_axes(self, display, points, include_z=True, geom=None):
+        if not points:
+            return
         try:
-            surf = grid.extract_surface()
-            # 给单元赋 Z 值用于着色
-            surf = surf.point_data_to_cell_data()
+            arr = np.array([[p[0], p[1], p[2]] for p in points], dtype=float)
+            arr = arr[np.isfinite(arr).all(axis=1)]
+            if arr.size == 0:
+                return
+            mins = np.nanmin(arr, axis=0)
+            maxs = np.nanmax(arr, axis=0)
+            span = np.maximum(maxs - mins, 1.0)
+            max_span = max(float(np.nanmax(span)), 1.0)
+            origin = self._scene_axes_origin(arr, geom)
+            length = max_span * 0.16
+            if include_z and span[2] <= 1e-6:
+                length_z = max_span * 0.10
+            else:
+                length_z = length
+
+            axes = [
+                ("X", (length, 0.0, 0.0), (0.85, 0.10, 0.08)),
+                ("Y", (0.0, length, 0.0), (0.05, 0.62, 0.12)),
+            ]
+            if include_z:
+                axes.append(("Z", (0.0, 0.0, length_z), (0.06, 0.18, 0.82)))
+
+            marker_r = max_span * 0.012
+            self._display_shapes(display, [self._sphere_shape(origin, marker_r)], color=(0.20, 0.20, 0.20), update=False)
+            for name, vec, color in axes:
+                end = origin + np.array(vec, dtype=float)
+                edge = self._edge_shape(origin, end)
+                self._display_shapes(display, [edge], color=color, update=False)
+                self._display_shapes(display, [self._sphere_shape(end, marker_r * 0.8)], color=color, update=False)
+                self._display_text(display, name, end + np.array(vec, dtype=float) * 0.08)
         except Exception:
-            surf = grid.extract_surface()
+            pass
 
-        plotter.add_mesh(surf, scalars="Z (mm)", cmap="jet",
-                         show_edges=False, lighting=True, smooth_shading=True,
-                         scalar_bar_args={"title": "Z (mm)", "fmt": "%.2f"})
-        return True
+    def _scene_axes_origin(self, arr, geom=None):
+        if geom:
+            try:
+                kind = geom.get("type", "")
+                if kind == "spherical":
+                    R = float(geom["R"])
+                    zc = float(geom.get("zc", 0.0))
+                    h = float(geom["h"])
+                    if geom.get("surf_type", "convex") == "convex":
+                        z0 = zc + R - h
+                    else:
+                        z0 = zc - R
+                    return np.array([0.0, 0.0, zc - z0], dtype=float)
 
-# ════════════════════════════════════════════════════════════════════
+                if kind == "cylindrical":
+                    R = float(geom["R"])
+                    zc = float(geom.get("zc", 0.0))
+                    kcut = float(geom.get("k_cut", zc - R))
+                    axis_mid = 0.5 * (float(geom["axis_min"]) + float(geom["axis_max"]))
+                    if geom.get("surf_type", "C") == "C":
+                        z0 = kcut
+                    else:
+                        z0 = zc - R
+                    if geom.get("axis_dir", "Y") == "Y":
+                        return np.array([0.0, axis_mid, zc - z0], dtype=float)
+                    return np.array([axis_mid, 0.0, zc - z0], dtype=float)
+
+                if kind == "conical":
+                    H = float(geom["H"])
+                    return np.array([0.0, 0.0, H * 0.5], dtype=float)
+
+                if kind == "aspherical":
+                    return np.array([0.0, float(geom.get("offcenter", 0.0)), 0.0], dtype=float)
+            except Exception:
+                pass
+
+        mins = np.nanmin(arr, axis=0)
+        maxs = np.nanmax(arr, axis=0)
+        return (mins + maxs) * 0.5
+
+    def close_occ(self):
+        for viewer in (self._viewer2d, self._viewer_surf, self._viewer_traj):
+            if viewer is None:
+                continue
+            try:
+                viewer.close()
+            except Exception:
+                pass
+
+    def plot(self, points, params):
+        self._stack.setCurrentIndex(0)
+        QApplication.processEvents()
+        if self._occ_error is not None:
+            return
+        display = self._display2d
+        self._clear_display(display)
+        if not points:
+            self._show_hint(display, "No trajectory points")
+            return
+        self._set_label(self._label2d, f"Trajectory | points: {len(points)} | green: start | red: end")
+
+        point_shapes, edge_shapes = self._trajectory_shapes(
+            points, break_long_edges=self._should_break_long_edges(params))
+        self._display_shapes(display, edge_shapes, color="BLUE", update=False)
+        self._display_shapes(display, point_shapes, color="BLUE", update=False)
+        self._draw_planar_boundary(display, params)
+        self._draw_scene_axes(display, points, include_z=False)
+
+        radius = self._marker_radius(points)
+        self._display_shapes(display, [self._sphere_shape(points[0], radius)], color="GREEN", update=False)
+        self._display_shapes(display, [self._sphere_shape(points[-1], radius)], color="RED", update=True)
+        self._fit_display(display, view="top")
+
+    def plot_surface(self, points, params):
+        self._stack.setCurrentIndex(1)
+        QApplication.processEvents()
+        if self._occ_error is not None:
+            return
+        self._clear_display(self._display_surf)
+        self._clear_display(self._display_traj)
+        if not points:
+            self._show_hint(self._display_traj, "No trajectory points")
+            return
+        self._set_label(self._label_surf, f"Shape | {params.get('surface_name', 'surface')}")
+        self._set_label(
+            self._label_traj,
+            f"Trajectory | {params.get('traj_name', '')} | points: {len(points)} | green: start | red: end",
+        )
+
+        surface_shapes = self._surface_shapes_from_geom(params.get("geom"))
+        if surface_shapes:
+            self._display_shapes(self._display_surf, surface_shapes, color=(0.35, 0.42, 0.50), update=True)
+        else:
+            point_shapes, _ = self._trajectory_shapes(points, max_points=12000, max_edges=0)
+            self._display_shapes(self._display_surf, point_shapes, color="BLUE", update=True)
+        geom = params.get("geom")
+        self._draw_scene_axes(self._display_surf, points, include_z=True, geom=geom)
+        self._fit_display(self._display_surf, view="iso")
+
+        point_shapes, edge_shapes = self._trajectory_shapes(
+            points, max_points=60000, max_edges=60000,
+            break_long_edges=self._should_break_long_edges(params))
+        self._display_shapes(self._display_traj, edge_shapes, color="BLUE", update=False)
+        self._display_shapes(self._display_traj, point_shapes, color="BLUE", update=False)
+        self._draw_scene_axes(self._display_traj, points, include_z=True, geom=geom)
+        radius = self._marker_radius(points)
+        self._display_shapes(self._display_traj, [self._sphere_shape(points[0], radius)], color="GREEN", update=False)
+        self._display_shapes(self._display_traj, [self._sphere_shape(points[-1], radius)], color="RED", update=True)
+        self._fit_display(self._display_traj, view="iso")
+
+    def _draw_planar_boundary(self, display, params):
+        shape = params.get("shape", "R")
+        if shape == "R":
+            A = float(params.get("rect_A", 0.0))
+            B = float(params.get("rect_B", 0.0))
+            if A <= 0 or B <= 0:
+                return
+            corners = [
+                (-A / 2, -B / 2, 0), (A / 2, -B / 2, 0),
+                (A / 2, B / 2, 0), (-A / 2, B / 2, 0),
+            ]
+            edges = [self._edge_shape(corners[i], corners[(i + 1) % 4]) for i in range(4)]
+            self._display_shapes(display, edges, color="BLACK", update=False)
+            return
+
+        R = float(params.get("circle_R", 0.0))
+        if R <= 0:
+            return
+        circle = []
+        samples = 96
+        ring = [(R * np.cos(2 * np.pi * i / samples), R * np.sin(2 * np.pi * i / samples), 0) for i in range(samples)]
+        for i in range(samples):
+            circle.append(self._edge_shape(ring[i], ring[(i + 1) % samples]))
+        self._display_shapes(display, circle, color="BLACK", update=False)
+
+    def _surface_shapes_from_geom(self, geom):
+        if not geom:
+            return []
+        kind = geom.get("type", "")
+        if kind == "spherical":
+            return self._sample_spherical_surface(geom)
+        if kind == "aspherical":
+            return self._sample_aspherical_surface(geom)
+        if kind == "cylindrical":
+            return self._sample_cylindrical_surface(geom)
+        if kind == "conical":
+            return self._sample_conical_surface(geom)
+        return []
+
+    def _grid_faces(self, X, Y, Z):
+        shapes = []
+        rows, cols = X.shape
+        for r in range(rows - 1):
+            for c in range(cols - 1):
+                p00 = (X[r, c], Y[r, c], Z[r, c])
+                p01 = (X[r, c + 1], Y[r, c + 1], Z[r, c + 1])
+                p11 = (X[r + 1, c + 1], Y[r + 1, c + 1], Z[r + 1, c + 1])
+                p10 = (X[r + 1, c], Y[r + 1, c], Z[r + 1, c])
+                for tri in ((p00, p01, p11), (p00, p11, p10)):
+                    face = self._face_shape(tri)
+                    if face is not None:
+                        shapes.append(face)
+        return shapes
+
+    def _sample_spherical_surface(self, geom):
+        R = float(geom["R"]); zc = float(geom.get("zc", 0.0))
+        h = float(geom["h"]); st = geom.get("surf_type", "convex")
+        if st == "convex":
+            z_cut = zc + R - h
+            r_proj = np.sqrt(max(0.0, R * R - (z_cut - zc) ** 2))
+            z0 = z_cut; sign = 1.0
+        else:
+            z_cut = zc - R
+            z_top = z_cut + h
+            r_proj = np.sqrt(max(0.0, R * R - (z_top - zc) ** 2))
+            z0 = z_cut; sign = -1.0
+        u = np.linspace(0, 2 * np.pi, 49)
+        v = np.linspace(max(r_proj / 28.0, 1e-6), r_proj, 28)
+        U, V = np.meshgrid(u, v)
+        X = V * np.cos(U); Y = V * np.sin(U)
+        Z = zc + sign * np.sqrt(np.maximum(0.0, R * R - X * X - Y * Y)) - z0
+        return self._grid_faces(X, Y, Z)
+
+    def _sample_aspherical_surface(self, geom):
+        R = float(geom["R"]); k = float(geom.get("k", 0.0))
+        if R == 0:
+            return []
+        C = -1.0 / R
+        off = float(geom.get("offcenter", 0.0))
+        coefs = [float(geom.get(name, 0.0)) for name in ("A4", "A6", "A8", "A10", "A12", "A14")]
+
+        def asp_z(x, y):
+            ys = y - off
+            r2 = x * x + ys * ys
+            sq = np.sqrt(np.maximum(0.0, 1.0 - (1.0 + k) * C * C * r2))
+            z = (C * r2) / (1.0 + sq)
+            for idx, coef in enumerate(coefs, start=2):
+                z += coef * r2 ** idx
+            return z
+
+        bt = int(geom.get("bound_type", 1))
+        if bt == 1:
+            W = float(geom.get("full_width", 0.0)); L = float(geom.get("full_length", 0.0))
+            xs = np.linspace(-W / 2, W / 2, 36); ys = np.linspace(-L / 2, L / 2, 36)
+            X, Y = np.meshgrid(xs, ys); Z = asp_z(X, Y)
+        elif bt == 2:
+            xs = np.linspace(float(geom["rect_xmin"]), float(geom["rect_xmax"]), 36)
+            ys = np.linspace(float(geom["rect_ymin"]), float(geom["rect_ymax"]), 36)
+            X, Y = np.meshgrid(xs, ys); Z = asp_z(X, Y)
+        else:
+            cR = float(geom["circ_R"]); cxc = float(geom.get("circ_xc", 0.0)); cyc = float(geom.get("circ_yc", 0.0))
+            u = np.linspace(0, 2 * np.pi, 49); v = np.linspace(max(cR / 28.0, 1e-6), cR, 28)
+            U, V = np.meshgrid(u, v)
+            X = cxc + V * np.cos(U); Y = cyc + V * np.sin(U); Z = asp_z(X, Y)
+        return self._grid_faces(X, Y, Z)
+
+    def _sample_cylindrical_surface(self, geom):
+        R = float(geom["R"]); zc = float(geom.get("zc", 0.0))
+        kcut = float(geom.get("k_cut", zc - R)); axis_dir = geom.get("axis_dir", "Y")
+        st = geom.get("surf_type", "C"); amin = float(geom["axis_min"]); amax = float(geom["axis_max"])
+        d_max = np.sqrt(max(0.0, R * R - (kcut - zc) ** 2))
+        d = np.linspace(-d_max, d_max, 36); axis = np.linspace(amin, amax, 36)
+        D, A = np.meshgrid(d, axis)
+        sign = 1.0 if st == "C" else -1.0
+        z0 = kcut if st == "C" else zc - R
+        Z = zc + sign * np.sqrt(np.maximum(0.0, R * R - D * D)) - z0
+        if axis_dir == "Y":
+            X, Y = D, A
+        else:
+            X, Y = A, D
+        return self._grid_faces(X, Y, Z)
+
+    def _sample_conical_surface(self, geom):
+        ctype = int(geom.get("cone_type", 1)); alpha = np.radians(float(geom["alpha_deg"]))
+        H = float(geom["H"]); tan_a = np.tan(alpha); R_base = H * tan_a
+        u = np.linspace(0, 2 * np.pi, 49); v = np.linspace(max(R_base / 28.0, 1e-6), R_base, 28)
+        U, V = np.meshgrid(u, v)
+        X = V * np.cos(U); Y = V * np.sin(U)
+        Z = H - V / tan_a if ctype == 1 else V / tan_a
+        return self._grid_faces(X, Y, Z)
+
 class ControlPanel(QStackedWidget):
     """
     仿照师兄软件：QDockWidget 里放 QStackedWidget，
@@ -557,6 +803,7 @@ class ControlPanel(QStackedWidget):
             QMessageBox.information(self._main, "保存成功",
                 f"轨迹文件已保存：\n{path}\n共 {len(self._points)} 个点")
             self._main.statusbar.showMessage(f"已保存至 {os.path.basename(path)}")
+            self._main.set_status(f"已保存至 {os.path.basename(path)}")
         except Exception as e:
             QMessageBox.critical(self._main, "保存失败", str(e))
 
@@ -581,6 +828,7 @@ class ControlPanel(QStackedWidget):
         self._main.statusbar.showMessage(
             f"{tname}生成完成，共 {len(points)} 个轨迹点")
         # 输出到结果终端
+        self._main.set_status(f"{tname}生成完成，共 {len(points)} 个轨迹点")
         xs = [p[0] for p in points]; ys = [p[1] for p in points]; zs = [p[2] for p in points]
         self._main.terminal_output.appendPlainText(
             f"[轨迹生成] {tname}，共 {len(points)} 个点\n"
@@ -1639,6 +1887,9 @@ class ControlPanel(QStackedWidget):
         tname = "栅形" if traj == "G" else "螺旋线"
         surf_cn = "凸球面" if surf == "convex" else "凹球面"
         params = {"surface_name": surf_cn, "traj_name": tname + "轨迹",
+                  "traj_type": traj, "direction": dire,
+                  "step_len": step_len, "line_spacing": line_spacing,
+                  "pitch": pitch, "arc_step": arc_step,
                   "geom": {"type": "spherical",
                            "R": R, "zc": zc, "h": h, "surf_type": surf}}
         self._finish(pts, params, self.sph_btn_save, self.sph_info_lbl,
@@ -1970,7 +2221,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         try:
-            self.preview.close_pyvista()
+            self.preview.close_occ()
         except Exception:
             pass
         super().closeEvent(event)
@@ -2004,7 +2255,21 @@ class MainWindow(QMainWindow):
         # 状态栏
         self.statusbar = QtWidgets.QStatusBar(self)
         self.setStatusBar(self.statusbar)
-        self.statusbar.showMessage("就绪")
+        self.status_message = QLabel("就绪")
+        self.status_message.setStyleSheet(
+            "QLabel {"
+            "color: #10243f;"
+            "font-family: Microsoft YaHei, SimHei, Arial;"
+            "font-size: 12px;"
+            "padding-left: 2px;"
+            "}"
+        )
+        self.statusbar.addWidget(self.status_message, 1)
+        self.statusbar.clearMessage()
+
+    def set_status(self, text):
+        self.statusbar.clearMessage()
+        self.status_message.setText(text)
 
     # ── Ribbon 工具栏（完全仿照 ShowGui.py 的 init_ribbon 写法）────
     def _build_ribbon(self):
@@ -2170,7 +2435,7 @@ def main():
         dlg.exec_()
 
     win = MainWindow()
-    app.aboutToQuit.connect(win.preview.close_pyvista)
+    app.aboutToQuit.connect(win.preview.close_occ)
     win.show()
     sys.exit(app.exec_())
 
