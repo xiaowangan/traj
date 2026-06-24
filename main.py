@@ -98,6 +98,9 @@ class PreviewCanvas(QWidget):
         self._label_surf = None
         self._label_traj = None
         self._label_hosts = []
+        self._surface_view_mode = "split"
+        self._surf_box = None
+        self._traj_box = None
 
         self._init_occ_widgets()
 
@@ -117,6 +120,7 @@ class PreviewCanvas(QWidget):
             lay3d.setContentsMargins(0, 0, 0, 0)
             lay3d.setSpacing(2)
             surf_box = QWidget(page3d)
+            self._surf_box = surf_box
             surf_layout = QVBoxLayout(surf_box)
             surf_layout.setContentsMargins(0, 0, 0, 0)
             self._viewer_surf, self._display_surf = self._make_viewer()
@@ -124,14 +128,15 @@ class PreviewCanvas(QWidget):
             self._label_surf = self._make_overlay_label(surf_box)
 
             traj_box = QWidget(page3d)
+            self._traj_box = traj_box
             traj_layout = QVBoxLayout(traj_box)
             traj_layout.setContentsMargins(0, 0, 0, 0)
             self._viewer_traj, self._display_traj = self._make_viewer()
             traj_layout.addWidget(self._viewer_traj)
             self._label_traj = self._make_overlay_label(traj_box)
 
-            lay3d.addWidget(surf_box)
-            lay3d.addWidget(traj_box)
+            lay3d.addWidget(surf_box, 1)
+            lay3d.addWidget(traj_box, 1)
             self._stack.addWidget(page3d)
 
             self._stack.setCurrentIndex(0)
@@ -181,6 +186,21 @@ class PreviewCanvas(QWidget):
         label.raise_()
         self._place_overlay_labels()
 
+    def set_surface_view_mode(self, mode):
+        self._surface_view_mode = "overlay" if mode == "overlay" else "split"
+        self._apply_surface_view_mode()
+
+    def _apply_surface_view_mode(self):
+        if self._surf_box is None or self._traj_box is None:
+            return
+        overlay = self._surface_view_mode == "overlay"
+        self._surf_box.setVisible(not overlay)
+        self._traj_box.setVisible(True)
+        if overlay and self._label_surf is not None:
+            self._label_surf.hide()
+        self._place_overlay_labels()
+        QtCore.QTimer.singleShot(0, self._sync_all_occ_views)
+
     def _place_overlay_labels(self):
         for host, label in self._label_hosts:
             if host is None or label is None:
@@ -213,9 +233,11 @@ class PreviewCanvas(QWidget):
             BRepBuilderAPI_MakeVertex,
         )
         from OCC.Core.BRepPrimAPI import BRepPrimAPI_MakeSphere
+        from OCC.Extend.DataExchange import read_stl_file
         from OCC.Core.gp import gp_Pnt
         from OCC.Core.Quantity import Quantity_Color, Quantity_TOC_RGB
         from OCC.Core.TopoDS import TopoDS_Compound
+        from OCC.Core.AIS import AIS_TextLabel
         return {
             "qtViewer3d": qtViewer3d,
             "BRep_Builder": BRep_Builder,
@@ -224,10 +246,12 @@ class PreviewCanvas(QWidget):
             "BRepBuilderAPI_MakePolygon": BRepBuilderAPI_MakePolygon,
             "BRepBuilderAPI_MakeVertex": BRepBuilderAPI_MakeVertex,
             "BRepPrimAPI_MakeSphere": BRepPrimAPI_MakeSphere,
+            "read_stl_file": read_stl_file,
             "gp_Pnt": gp_Pnt,
             "Quantity_Color": Quantity_Color,
             "Quantity_TOC_RGB": Quantity_TOC_RGB,
             "TopoDS_Compound": TopoDS_Compound,
+            "AIS_TextLabel": AIS_TextLabel,
         }
 
     def _make_viewer(self):
@@ -249,12 +273,15 @@ class PreviewCanvas(QWidget):
         if display is None:
             return
         try:
-            display.Context.EraseAll(True)
+            display.Context.RemoveAll(True)
         except Exception:
             try:
-                display.EraseAll()
+                display.Context.EraseAll(True)
             except Exception:
-                pass
+                try:
+                    display.EraseAll()
+                except Exception:
+                    pass
 
     def _show_hint(self, display, text):
         if display is None:
@@ -271,10 +298,13 @@ class PreviewCanvas(QWidget):
             return
         occ = self._occ_imports()
         try:
-            display.DisplayMessage(
-                occ["gp_Pnt"](float(point[0]), float(point[1]), float(point[2])),
-                str(text),
-            )
+            label = occ["AIS_TextLabel"]()
+            label.SetText(str(text))
+            label.SetPosition(occ["gp_Pnt"](float(point[0]), float(point[1]), float(point[2])))
+            label.SetHeight(10.0)
+            qc = occ["Quantity_Color"](0.0, 0.0, 0.0, occ["Quantity_TOC_RGB"])
+            label.SetColor(qc)
+            display.Context.Display(label, False)
         except Exception:
             pass
 
@@ -409,6 +439,28 @@ class PreviewCanvas(QWidget):
             pass
         self._place_overlay_labels()
 
+    def _refresh_empty_display(self, display):
+        if display is None:
+            return
+        self._sync_occ_view(display)
+        try:
+            display.set_bg_gradient_color([188, 205, 224], [223, 233, 245])
+        except Exception:
+            pass
+        try:
+            display.View_Iso()
+        except Exception:
+            pass
+        try:
+            display.Context.UpdateCurrentViewer()
+        except Exception:
+            pass
+        try:
+            display.Repaint()
+        except Exception:
+            pass
+        self._place_overlay_labels()
+
     def _sync_occ_view(self, display):
         viewer = self._display_viewers.get(id(display))
         if viewer is not None:
@@ -493,7 +545,7 @@ class PreviewCanvas(QWidget):
             span = np.maximum(maxs - mins, 1.0)
             max_span = max(float(np.nanmax(span)), 1.0)
             origin = self._scene_axes_origin(arr, geom)
-            length = max_span * 0.16
+            length = max_span * 0.25
             if include_z and span[2] <= 1e-6:
                 length_z = max_span * 0.10
             else:
@@ -592,6 +644,7 @@ class PreviewCanvas(QWidget):
 
     def plot_surface(self, points, params):
         self._stack.setCurrentIndex(1)
+        self._apply_surface_view_mode()
         QApplication.processEvents()
         if self._occ_error is not None:
             return
@@ -600,25 +653,42 @@ class PreviewCanvas(QWidget):
         if not points:
             self._show_hint(self._display_traj, "No trajectory points")
             return
-        self._set_label(self._label_surf, f"Shape | {params.get('surface_name', 'surface')}")
-        self._set_label(
-            self._label_traj,
-            f"Trajectory | {params.get('traj_name', '')} | points: {len(points)} | green: start | red: end",
-        )
+        overlay = self._surface_view_mode == "overlay"
+        if not overlay:
+            self._set_label(self._label_surf, f"曲面 | {params.get('surface_name', 'surface')}")
+        elif self._label_surf is not None:
+            self._label_surf.hide()
+        traj_label = f"Trajectory | {params.get('traj_name', '')} | points: {len(points)}"
+        if not overlay:
+            traj_label += " | green: start | red: end"
+        self._set_label(self._label_traj, traj_label)
 
-        surface_shapes = self._surface_shapes_from_geom(params.get("geom"))
-        if surface_shapes:
-            self._display_shapes(self._display_surf, surface_shapes, color=(0.35, 0.42, 0.50), update=True)
-        else:
-            point_shapes, _ = self._trajectory_shapes(points, max_points=12000, max_edges=0)
-            self._display_shapes(self._display_surf, point_shapes, color="BLUE", update=True)
         geom = params.get("geom")
-        self._draw_scene_axes(self._display_surf, points, include_z=True, geom=geom)
-        self._fit_display(self._display_surf, view="iso")
-
+        surface_shapes = self._surface_shapes_from_geom(params.get("geom"))
         point_shapes, edge_shapes = self._trajectory_shapes(
             points, max_points=60000, max_edges=60000,
             break_long_edges=self._should_break_long_edges(params))
+
+        if overlay:
+            if surface_shapes:
+                self._display_shapes(self._display_traj, surface_shapes, color=(0.35, 0.42, 0.50), update=False)
+            self._display_shapes(self._display_traj, edge_shapes, color="BLUE", update=False)
+            self._display_shapes(self._display_traj, point_shapes, color="BLUE", update=False)
+            self._draw_scene_axes(self._display_traj, points, include_z=True, geom=geom)
+            radius = self._marker_radius(points)
+            self._display_shapes(self._display_traj, [self._sphere_shape(points[0], radius)], color="GREEN", update=False)
+            self._display_shapes(self._display_traj, [self._sphere_shape(points[-1], radius)], color="RED", update=True)
+            self._fit_display(self._display_traj, view="iso")
+            return
+
+        if surface_shapes:
+            self._display_shapes(self._display_surf, surface_shapes, color=(0.35, 0.42, 0.50), update=True)
+        else:
+            surf_point_shapes, _ = self._trajectory_shapes(points, max_points=12000, max_edges=0)
+            self._display_shapes(self._display_surf, surf_point_shapes, color="BLUE", update=True)
+        self._draw_scene_axes(self._display_surf, points, include_z=True, geom=geom)
+        self._fit_display(self._display_surf, view="iso")
+
         self._display_shapes(self._display_traj, edge_shapes, color="BLUE", update=False)
         self._display_shapes(self._display_traj, point_shapes, color="BLUE", update=False)
         self._draw_scene_axes(self._display_traj, points, include_z=True, geom=geom)
@@ -626,6 +696,36 @@ class PreviewCanvas(QWidget):
         self._display_shapes(self._display_traj, [self._sphere_shape(points[0], radius)], color="GREEN", update=False)
         self._display_shapes(self._display_traj, [self._sphere_shape(points[-1], radius)], color="RED", update=True)
         self._fit_display(self._display_traj, view="iso")
+
+    def import_stl_to_shape(self, path):
+        self._stack.setCurrentIndex(1)
+        self._apply_surface_view_mode()
+        QApplication.processEvents()
+        if self._occ_error is not None:
+            raise RuntimeError(str(self._occ_error))
+
+        occ = self._occ_imports()
+        shape = occ["read_stl_file"](path)
+        if shape is None or shape.IsNull():
+            raise ValueError("STL model is empty or cannot be read.")
+
+        self._clear_display(self._display_surf)
+        self._clear_display(self._display_traj)
+        name = os.path.basename(path)
+        if self._surface_view_mode == "overlay":
+            if self._label_surf is not None:
+                self._label_surf.hide()
+            self._set_label(self._label_traj, f"曲面 | {name}")
+            self._display_shapes(self._display_traj, [shape], color=(0.35, 0.42, 0.50), update=True)
+            self._fit_display(self._display_traj, view="iso")
+        else:
+            self._set_label(self._label_surf, f"曲面 | {name}")
+            self._set_label(self._label_traj, "Trajectory | no generated trajectory")
+            self._display_shapes(self._display_surf, [shape], color=(0.35, 0.42, 0.50), update=True)
+            self._fit_display(self._display_surf, view="iso")
+            QtCore.QTimer.singleShot(0, lambda: self._refresh_empty_display(self._display_traj))
+            QtCore.QTimer.singleShot(120, lambda: self._refresh_empty_display(self._display_traj))
+        return shape
 
     def _draw_planar_boundary(self, display, params):
         shape = params.get("shape", "R")
@@ -693,6 +793,7 @@ class PreviewCanvas(QWidget):
             z_top = z_cut + h
             r_proj = np.sqrt(max(0.0, R * R - (z_top - zc) ** 2))
             z0 = z_cut; sign = -1.0
+
         u = np.linspace(0, 2 * np.pi, 49)
         v = np.linspace(max(r_proj / 28.0, 1e-6), r_proj, 28)
         U, V = np.meshgrid(u, v)
@@ -770,7 +871,7 @@ class ControlPanel(QStackedWidget):
 
         # 记录各页面索引
         self.idx_blank   = self.count()
-        self.addWidget(QWidget())    # page 0：空白（初始状态）
+        self.addWidget(self._build_blank_page())    # page 0：空白（初始状态）
 
         self.idx_license = self.count()
         self.addWidget(self._build_license_page())
@@ -782,8 +883,22 @@ class ControlPanel(QStackedWidget):
         # 当前缓存的轨迹点和参数
         self._points = []
         self._params = {}
+        self._last_is_surface = False
 
     # ── 共用：保存 TXT ──────────────────────────────────────────────
+    def _build_blank_page(self):
+        page = QWidget()
+        page.setAutoFillBackground(True)
+        page.setStyleSheet("background-color: #dfe9f5;")
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        blank = QLabel("")
+        blank.setStyleSheet("background-color: #dfe9f5;")
+        blank.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        layout.addWidget(blank)
+        return page
+
     def _do_save(self, traj_name, fname_hint, is_surface=False):
         if not self._points:
             QMessageBox.warning(self._main, "提示", "请先生成轨迹")
@@ -810,6 +925,7 @@ class ControlPanel(QStackedWidget):
     def _finish(self, points, params, save_btn, info_lbl, tname, is_surface=False):
         self._points = points
         self._params = params
+        self._last_is_surface = is_surface
         if is_surface:
             self._main.preview.plot_surface(points, params)
         else:
@@ -1341,8 +1457,8 @@ class ControlPanel(QStackedWidget):
         layout.addWidget(grp2)
 
         # ③ 栅形参数
-        grp3 = QGroupBox("栅形参数")
-        g3 = QVBoxLayout(grp3)
+        self.pl_grp_raster = QGroupBox("栅形参数")
+        g3 = QVBoxLayout(self.pl_grp_raster)
         self.pl_cmb_dir = QComboBox()
         self.pl_cmb_dir.addItems(["平行于 X 轴（沿 Y 方向推进）",
                                    "平行于 Y 轴（沿 X 方向推进）"])
@@ -1351,38 +1467,49 @@ class ControlPanel(QStackedWidget):
         self.pl_edt_spacing, row_sp  = lineedit_input("线间距 (mm)：",   "5.0")
         g3.addLayout(row_st); g3.addLayout(row_sp)
         self.pl_cmb_cover = QComboBox()
-        self.pl_cmb_cover.addItems(["完全覆盖形状_覆盖整个平面", "仅覆盖子区域_设置的区域"])
-        combox_input(g3, "覆盖类型：", self.pl_cmb_cover)
+        self.pl_cmb_cover.addItems(["全部覆盖", "局部子区域"])
+        combox_input(g3, "覆盖范围：", self.pl_cmb_cover)
+        # 子区域参数（全部覆盖时隐藏）
         self.pl_lbl_sub = QLabel("── 子区域参数 ──")
         g3.addWidget(self.pl_lbl_sub)
         self.pl_edt_sx0, row_sx0 = lineedit_input("左下角 X₀ (mm)：", "0")
         self.pl_edt_sy0, row_sy0 = lineedit_input("左下角 Y₀ (mm)：", "0")
         self.pl_edt_sC,  row_sC  = lineedit_input("区域长 C (mm)：",  "10")
         self.pl_edt_sD,  row_sD  = lineedit_input("区域宽 D (mm)：",  "10")
+        self.pl_wrap_rsub = QWidget()
+        wrs = QVBoxLayout(self.pl_wrap_rsub)
+        wrs.setContentsMargins(0, 0, 0, 0); wrs.setSpacing(2)
         for row in [row_sx0, row_sy0, row_sC, row_sD]:
-            g3.addLayout(row)
-        layout.addWidget(grp3)
+            wrs.addLayout(row)
+        g3.addWidget(self.pl_wrap_rsub)
+        layout.addWidget(self.pl_grp_raster)
 
         # ④ 螺旋线参数
-        grp4 = QGroupBox("螺旋线参数")
-        g4 = QVBoxLayout(grp4)
+        self.pl_grp_spiral = QGroupBox("螺旋线参数")
+        g4 = QVBoxLayout(self.pl_grp_spiral)
         self.pl_edt_pitch,   row_pit = lineedit_input("螺距（每圈半径增量，mm）：", "5.0")
         self.pl_edt_arcstep, row_as  = lineedit_input("弧长步长（点间距，mm）：",   "1.0")
         g4.addLayout(row_pit); g4.addLayout(row_as)
         self.pl_cmb_spiral_cover = QComboBox()
         self.pl_cmb_spiral_cover.addItems(["圆形覆盖范围", "矩形覆盖范围"])
-        combox_input(g4, "螺旋覆盖类型：", self.pl_cmb_spiral_cover)
+        combox_input(g4, "覆盖范围：", self.pl_cmb_spiral_cover)
+        # 圆形参数
         self.pl_edt_Rmax, row_rm = lineedit_input("最大半径 R_max (mm)：", "50")
         g4.addLayout(row_rm)
+        # 矩形参数
         self.pl_lbl_srect = QLabel("── 矩形范围参数 ──")
         g4.addWidget(self.pl_lbl_srect)
         self.pl_edt_sxmin, row_sxn = lineedit_input("X_min (mm)：",  "0")
         self.pl_edt_symin, row_syn = lineedit_input("Y_min (mm)：",  "0")
         self.pl_edt_sxmax, row_sxx = lineedit_input("X_max (mm)：", "100")
         self.pl_edt_symax, row_syx = lineedit_input("Y_max (mm)：", "100")
+        self.pl_wrap_ssub = QWidget()
+        wss = QVBoxLayout(self.pl_wrap_ssub)
+        wss.setContentsMargins(0, 0, 0, 0); wss.setSpacing(2)
         for row in [row_sxn, row_syn, row_sxx, row_syx]:
-            g4.addLayout(row)
-        layout.addWidget(grp4)
+            wss.addLayout(row)
+        g4.addWidget(self.pl_wrap_ssub)
+        layout.addWidget(self.pl_grp_spiral)
 
         # ⑤ 输出
         grp5 = QGroupBox("输出设置")
@@ -1425,34 +1552,23 @@ class ControlPanel(QStackedWidget):
 
     def _pl_traj_changed(self):
         is_raster = (self.pl_cmb_traj.currentIndex() == 0)
-        # 栅形控件
-        for w in [self.pl_cmb_dir, self.pl_edt_step, self.pl_edt_spacing,
-                  self.pl_cmb_cover]:
-            w.setVisible(is_raster)
-        # 子区域（受 cover 控制，先全部按 raster 来，再由 _pl_cover_changed 精细控制）
-        self.pl_lbl_sub.setVisible(is_raster and self.pl_cmb_cover.currentIndex() == 1)
-        for w in [self.pl_edt_sx0, self.pl_edt_sy0, self.pl_edt_sC, self.pl_edt_sD]:
-            w.setVisible(is_raster and self.pl_cmb_cover.currentIndex() == 1)
-        # 螺旋线控件
-        for w in [self.pl_edt_pitch, self.pl_edt_arcstep, self.pl_cmb_spiral_cover]:
-            w.setVisible(not is_raster)
-        self._pl_spiral_cover_changed()
+        self.pl_grp_raster.setVisible(is_raster)
+        self.pl_grp_spiral.setVisible(not is_raster)
+        if is_raster:
+            self._pl_cover_changed()
+        else:
+            self._pl_spiral_cover_changed()
 
     def _pl_cover_changed(self):
-        is_raster = (self.pl_cmb_traj.currentIndex() == 0)
-        sub = is_raster and (self.pl_cmb_cover.currentIndex() == 1)
+        sub = (self.pl_cmb_cover.currentIndex() == 1)
         self.pl_lbl_sub.setVisible(sub)
-        for w in [self.pl_edt_sx0, self.pl_edt_sy0, self.pl_edt_sC, self.pl_edt_sD]:
-            w.setVisible(sub)
+        self.pl_wrap_rsub.setVisible(sub)
 
     def _pl_spiral_cover_changed(self):
-        is_raster = (self.pl_cmb_traj.currentIndex() == 0)
         is_circ = (self.pl_cmb_spiral_cover.currentIndex() == 0)
-        self.pl_edt_Rmax.setVisible(not is_raster and is_circ)
-        self.pl_lbl_srect.setVisible(not is_raster and not is_circ)
-        for w in [self.pl_edt_sxmin, self.pl_edt_symin,
-                  self.pl_edt_sxmax, self.pl_edt_symax]:
-            w.setVisible(not is_raster and not is_circ)
+        self.pl_edt_Rmax.setVisible(is_circ)
+        self.pl_lbl_srect.setVisible(not is_circ)
+        self.pl_wrap_ssub.setVisible(not is_circ)
 
     def _do_generate_planar(self):
         def f(e, n):
@@ -1547,10 +1663,29 @@ class ControlPanel(QStackedWidget):
 
         outer_layout.addWidget(self.surf_stack, 1)
 
+        view_grp = QGroupBox("3D显示模式")
+        view_layout = QVBoxLayout(view_grp)
+        self.surface_view_cmb = QComboBox()
+        self.surface_view_cmb.addItems([
+            "左侧显示曲面，右侧显示轨迹",
+            "轨迹覆盖在曲面上",
+        ])
+        self.surface_view_cmb.setFixedHeight(30)
+        view_layout.addWidget(self.surface_view_cmb)
+        outer_layout.addWidget(view_grp)
+
         self.surf_cmb.currentIndexChanged.connect(
             lambda idx: self.surf_stack.setCurrentIndex(idx))
+        self.surface_view_cmb.currentIndexChanged.connect(self._surface_view_mode_changed)
 
         return outer
+
+    def _surface_view_mode_changed(self, idx):
+        mode = "overlay" if idx == 1 else "split"
+        if self._main is not None and getattr(self._main, "preview", None) is not None:
+            self._main.preview.set_surface_view_mode(mode)
+            if getattr(self, "_last_is_surface", False) and self._points:
+                self._main.preview.plot_surface(self._points, self._params)
 
     def _build_surface_control_group(self):
         grp = QGroupBox("曲面轨迹总控制")
@@ -1640,16 +1775,24 @@ class ControlPanel(QStackedWidget):
         self.asp_edt_xmax, row_xx = lineedit_input("X_max (mm)：",  "50")
         self.asp_edt_ymin, row_yn = lineedit_input("Y_min (mm)：", "-50")
         self.asp_edt_ymax, row_yx = lineedit_input("Y_max (mm)：",  "50")
+        self.asp_wrap_rect = QWidget()
+        wr = QVBoxLayout(self.asp_wrap_rect)
+        wr.setContentsMargins(0, 0, 0, 0); wr.setSpacing(2)
         for row in [row_xn, row_xx, row_yn, row_yx]:
-            g4.addLayout(row)
+            wr.addLayout(row)
+        g4.addWidget(self.asp_wrap_rect)
 
         self.asp_lbl_circ = QLabel("── 圆形边界参数 ──")
         g4.addWidget(self.asp_lbl_circ)
         self.asp_edt_cR,  row_cR  = lineedit_input("圆形半径 (mm)：", "50")
         self.asp_edt_cxc, row_cxc = lineedit_input("圆心 X (mm)：",   "0")
         self.asp_edt_cyc, row_cyc = lineedit_input("圆心 Y (mm)：",   "0")
+        self.asp_wrap_circ = QWidget()
+        wc = QVBoxLayout(self.asp_wrap_circ)
+        wc.setContentsMargins(0, 0, 0, 0); wc.setSpacing(2)
         for row in [row_cR, row_cxc, row_cyc]:
-            g4.addLayout(row)
+            wc.addLayout(row)
+        g4.addWidget(self.asp_wrap_circ)
         layout.addWidget(grp4)
 
         grp5 = QGroupBox("轨迹参数")
@@ -1706,19 +1849,16 @@ class ControlPanel(QStackedWidget):
         show_rect = (idx == 1)
         show_circ = (idx == 2)
         self.asp_lbl_rect.setVisible(show_rect)
-        for w in [self.asp_edt_xmin, self.asp_edt_xmax,
-                  self.asp_edt_ymin, self.asp_edt_ymax]:
-            w.setVisible(show_rect)
+        self.asp_wrap_rect.setVisible(show_rect)
         self.asp_lbl_circ.setVisible(show_circ)
-        for w in [self.asp_edt_cR, self.asp_edt_cxc, self.asp_edt_cyc]:
-            w.setVisible(show_circ)
+        self.asp_wrap_circ.setVisible(show_circ)
 
     def _asp_traj_changed(self):
         is_raster = (self.asp_cmb_traj.currentIndex() == 0)
         self.asp_cmb_dir.setVisible(is_raster)
         # 间距/步长始终显示，不随轨迹类型切换
-        self.asp_edt_spacing.setVisible(True)
-        self.asp_edt_step.setVisible(True)
+        self.asp_edt_spacing.setVisible(False)
+        self.asp_edt_step.setVisible(False)
         self.asp_edt_pitch.setVisible(False)
         self.asp_edt_arcstep.setVisible(False)
 
@@ -1805,6 +1945,43 @@ class ControlPanel(QStackedWidget):
         combox_input(g1, "表面类型：", self.sph_cmb_type)
         layout.addWidget(grp1)
 
+        # —— 覆盖范围 ——
+        grp_cv = QGroupBox("覆盖范围")
+        gcv = QVBoxLayout(grp_cv)
+        self.sph_cmb_cover = QComboBox()
+        self.sph_cmb_cover.addItems([
+            "全部覆盖（整个球冠投影圆）",
+            "局部矩形区域",
+            "局部圆形区域",
+        ])
+        combox_input(gcv, "覆盖类型：", self.sph_cmb_cover)
+
+        self.sph_lbl_rect = QLabel("── 矩形区域参数 ──")
+        gcv.addWidget(self.sph_lbl_rect)
+        self.sph_edt_rxmin, row_rxn = lineedit_input("X_min (mm)：", "-50")
+        self.sph_edt_rxmax, row_rxx = lineedit_input("X_max (mm)：",  "50")
+        self.sph_edt_rymin, row_ryn = lineedit_input("Y_min (mm)：", "-50")
+        self.sph_edt_rymax, row_ryx = lineedit_input("Y_max (mm)：",  "50")
+        self.sph_wrap_rect = QWidget()
+        wr = QVBoxLayout(self.sph_wrap_rect)
+        wr.setContentsMargins(0, 0, 0, 0); wr.setSpacing(2)
+        for row in [row_rxn, row_rxx, row_ryn, row_ryx]:
+            wr.addLayout(row)
+        gcv.addWidget(self.sph_wrap_rect)
+
+        self.sph_lbl_circ = QLabel("── 圆形区域参数 ──")
+        gcv.addWidget(self.sph_lbl_circ)
+        self.sph_edt_cR,  row_cR  = lineedit_input("圆形半径 (mm)：", "50")
+        self.sph_edt_cxc, row_cxc = lineedit_input("圆心 X (mm)：",   "0")
+        self.sph_edt_cyc, row_cyc = lineedit_input("圆心 Y (mm)：",   "0")
+        self.sph_wrap_circ = QWidget()
+        wc = QVBoxLayout(self.sph_wrap_circ)
+        wc.setContentsMargins(0, 0, 0, 0); wc.setSpacing(2)
+        for row in [row_cR, row_cxc, row_cyc]:
+            wc.addLayout(row)
+        gcv.addWidget(self.sph_wrap_circ)
+        layout.addWidget(grp_cv)
+
         grp2 = QGroupBox("轨迹参数")
         g2 = QVBoxLayout(grp2)
         self.sph_cmb_traj = QComboBox()
@@ -1846,19 +2023,30 @@ class ControlPanel(QStackedWidget):
         layout.addStretch()
 
         self.sph_cmb_traj.currentIndexChanged.connect(self._sph_traj_changed)
+        self.sph_cmb_cover.currentIndexChanged.connect(self._sph_cover_changed)
         self.sph_btn_gen.clicked.connect(self._do_generate_spherical)
         self.sph_btn_save.clicked.connect(
             lambda: self._do_save("球面轨迹", self.sph_edt_fname.text(), is_surface=True))
         self._sph_traj_changed()
+        self._sph_cover_changed()
         return scroll
 
     def _sph_traj_changed(self):
         is_raster = (self.sph_cmb_traj.currentIndex() == 0)
         self.sph_cmb_dir.setVisible(is_raster)
-        self.sph_edt_spacing.setVisible(True)
-        self.sph_edt_step.setVisible(True)
+        self.sph_edt_spacing.setVisible(False)
+        self.sph_edt_step.setVisible(False)
         self.sph_edt_pitch.setVisible(False)
         self.sph_edt_arcstep.setVisible(False)
+
+    def _sph_cover_changed(self):
+        idx = self.sph_cmb_cover.currentIndex()
+        show_rect = (idx == 1)
+        show_circ = (idx == 2)
+        self.sph_lbl_rect.setVisible(show_rect)
+        self.sph_wrap_rect.setVisible(show_rect)
+        self.sph_lbl_circ.setVisible(show_circ)
+        self.sph_wrap_circ.setVisible(show_circ)
 
     def _do_generate_spherical(self):
         def f(e, n):
@@ -1871,27 +2059,47 @@ class ControlPanel(QStackedWidget):
             surf = "convex" if self.sph_cmb_type.currentIndex() == 0 else "concave"
             traj = "G" if self.sph_cmb_traj.currentIndex() == 0 else "S"
             dire = "X" if self.sph_cmb_dir.currentIndex()  == 0 else "Y"
+            cover = self.sph_cmb_cover.currentIndex() + 1  # 1/2/3
             step_len, line_spacing, pitch, arc_step = self._read_surface_step_spacing(
                 self.sph_ctrl_step, self.sph_ctrl_spacing)
+            kwargs = dict(R=R, zc=zc, surf_type=surf, h=h,
+                          traj_type=traj, direction=dire,
+                          step_len=step_len, line_spacing=line_spacing,
+                          pitch=pitch, arc_step=arc_step,
+                          cover_type=cover)
+            if cover == 2:
+                kwargs.update(rect_xmin=f(self.sph_edt_rxmin, "X_min"),
+                              rect_xmax=f(self.sph_edt_rxmax, "X_max"),
+                              rect_ymin=f(self.sph_edt_rymin, "Y_min"),
+                              rect_ymax=f(self.sph_edt_rymax, "Y_max"))
+            elif cover == 3:
+                kwargs.update(circ_R=f(self.sph_edt_cR, "圆形半径"),
+                              circ_xc=f(self.sph_edt_cxc, "圆心X"),
+                              circ_yc=f(self.sph_edt_cyc, "圆心Y"))
         except ValueError as e:
             QMessageBox.warning(self._main, "参数错误", str(e)); return
         try:
-            pts = generate_spherical(R=R, zc=zc, surf_type=surf, h=h,
-                                     traj_type=traj, direction=dire,
-                                     step_len=step_len, line_spacing=line_spacing,
-                                     pitch=pitch, arc_step=arc_step)
+            pts = generate_spherical(**kwargs)
         except ValueError as e:
             QMessageBox.warning(self._main, "生成失败", str(e)); return
         if not pts:
             QMessageBox.warning(self._main, "警告", "未生成任何轨迹点"); return
         tname = "栅形" if traj == "G" else "螺旋线"
         surf_cn = "凸球面" if surf == "convex" else "凹球面"
+        geom = {"type": "spherical",
+                "R": R, "zc": zc, "h": h, "surf_type": surf,
+                "cover_type": cover}
+        if cover == 2:
+            geom.update(rect_xmin=kwargs["rect_xmin"], rect_xmax=kwargs["rect_xmax"],
+                        rect_ymin=kwargs["rect_ymin"], rect_ymax=kwargs["rect_ymax"])
+        elif cover == 3:
+            geom.update(circ_R=kwargs["circ_R"],
+                        circ_xc=kwargs["circ_xc"], circ_yc=kwargs["circ_yc"])
         params = {"surface_name": surf_cn, "traj_name": tname + "轨迹",
                   "traj_type": traj, "direction": dire,
                   "step_len": step_len, "line_spacing": line_spacing,
                   "pitch": pitch, "arc_step": arc_step,
-                  "geom": {"type": "spherical",
-                           "R": R, "zc": zc, "h": h, "surf_type": surf}}
+                  "geom": geom}
         self._finish(pts, params, self.sph_btn_save, self.sph_info_lbl,
                      f"{surf_cn}{tname}轨迹", is_surface=True)
 
@@ -1930,7 +2138,8 @@ class ControlPanel(QStackedWidget):
         self.cyl_cmb_proj.addItems(["矩形投影区域", "圆形投影区域"])
         combox_input(g2, "投影形状：", self.cyl_cmb_proj)
         self.cyl_edt_projR, row_pR = lineedit_input("圆形投影半径 (mm)：", "50")
-        g2.addLayout(row_pR)
+        self.cyl_wrap_projR = QWidget(); self.cyl_wrap_projR.setLayout(row_pR)
+        g2.addWidget(self.cyl_wrap_projR)
         layout.addWidget(grp2)
 
         grp3 = QGroupBox("轨迹参数")
@@ -1985,14 +2194,14 @@ class ControlPanel(QStackedWidget):
     def _cyl_traj_changed(self):
         is_raster = (self.cyl_cmb_traj.currentIndex() == 0)
         self.cyl_cmb_dir.setVisible(is_raster)
-        self.cyl_edt_spacing.setVisible(True)
-        self.cyl_edt_step.setVisible(True)
+        self.cyl_edt_spacing.setVisible(False)
+        self.cyl_edt_step.setVisible(False)
         self.cyl_edt_pitch.setVisible(False)
         self.cyl_edt_arcstep.setVisible(False)
 
     def _cyl_proj_changed(self):
         is_circ = (self.cyl_cmb_proj.currentIndex() == 1)
-        self.cyl_edt_projR.setVisible(is_circ)
+        self.cyl_wrap_projR.setVisible(is_circ)
 
     def _do_generate_cylindrical(self):
         def f(e, n):
@@ -2075,16 +2284,24 @@ class ControlPanel(QStackedWidget):
         self.con_edt_rxmax, row_rxx = lineedit_input("X_max (mm)：",  "50")
         self.con_edt_rymin, row_ryn = lineedit_input("Y_min (mm)：", "-50")
         self.con_edt_rymax, row_ryx = lineedit_input("Y_max (mm)：",  "50")
+        self.con_wrap_rect = QWidget()
+        wr = QVBoxLayout(self.con_wrap_rect)
+        wr.setContentsMargins(0, 0, 0, 0); wr.setSpacing(2)
         for row in [row_rxn, row_rxx, row_ryn, row_ryx]:
-            g2.addLayout(row)
+            wr.addLayout(row)
+        g2.addWidget(self.con_wrap_rect)
 
         self.con_lbl_circ = QLabel("── 圆形区域参数 ──")
         g2.addWidget(self.con_lbl_circ)
         self.con_edt_cR,  row_cR  = lineedit_input("圆形半径 (mm)：", "50")
         self.con_edt_cxc, row_cxc = lineedit_input("圆心 X (mm)：",   "0")
         self.con_edt_cyc, row_cyc = lineedit_input("圆心 Y (mm)：",   "0")
+        self.con_wrap_circ = QWidget()
+        wc = QVBoxLayout(self.con_wrap_circ)
+        wc.setContentsMargins(0, 0, 0, 0); wc.setSpacing(2)
         for row in [row_cR, row_cxc, row_cyc]:
-            g2.addLayout(row)
+            wc.addLayout(row)
+        g2.addWidget(self.con_wrap_circ)
         layout.addWidget(grp2)
 
         grp3 = QGroupBox("轨迹参数")
@@ -2141,18 +2358,15 @@ class ControlPanel(QStackedWidget):
         show_rect = (idx == 1)
         show_circ = (idx == 2)
         self.con_lbl_rect.setVisible(show_rect)
-        for w in [self.con_edt_rxmin, self.con_edt_rxmax,
-                  self.con_edt_rymin, self.con_edt_rymax]:
-            w.setVisible(show_rect)
+        self.con_wrap_rect.setVisible(show_rect)
         self.con_lbl_circ.setVisible(show_circ)
-        for w in [self.con_edt_cR, self.con_edt_cxc, self.con_edt_cyc]:
-            w.setVisible(show_circ)
+        self.con_wrap_circ.setVisible(show_circ)
 
     def _con_traj_changed(self):
         is_raster = (self.con_cmb_traj.currentIndex() == 0)
         self.con_cmb_dir.setVisible(is_raster)
-        self.con_edt_spacing.setVisible(True)
-        self.con_edt_step.setVisible(True)
+        self.con_edt_spacing.setVisible(False)
+        self.con_edt_step.setVisible(False)
         self.con_edt_pitch.setVisible(False)
         self.con_edt_arcstep.setVisible(False)
 
@@ -2279,6 +2493,12 @@ class MainWindow(QMainWindow):
         # ── Tab：轨迹规划 ──────────────────────────────────────────
         tab_traj = self._ribbon.add_ribbon_tab("轨迹规划")
 
+        pane_model = tab_traj.add_ribbon_pane("模型")
+        act_import = self._make_action("导入模型", "import_file",
+                                       "导入 STL 模型到曲面显示区",
+                                       self._import_stl_model)
+        pane_model.add_ribbon_widget(RibbonButton(self, act_import, True))
+
         pane_surf = tab_traj.add_ribbon_pane("轨迹规划")
         act_surf  = self._make_action("轨迹规划", "zhexian",
                                        "平面/非球面/球面/柱面/锥面轨迹规划",
@@ -2321,6 +2541,22 @@ class MainWindow(QMainWindow):
 
     def _show_surface(self):
         self.stacked_widget.setCurrentIndex(self.stacked_widget.idx_surface)
+
+    def _import_stl_model(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "导入 STL 模型", "", "STL 模型 (*.stl *.STL)")
+        if not path:
+            return
+        try:
+            self.imported_stl_path = path
+            self.imported_stl_shape = self.preview.import_stl_to_shape(path)
+            self.stacked_widget.setCurrentIndex(self.stacked_widget.idx_blank)
+            name = os.path.basename(path)
+            self.statusbar.showMessage(f"STL 模型导入成功：{name}")
+            self.set_status(f"STL 模型导入成功：{name}")
+            self.terminal_output.appendPlainText(f"[模型导入] STL: {path}")
+        except Exception as e:
+            QMessageBox.critical(self, "导入失败", str(e))
 
     def _quick_save(self):
         """Ribbon 上的 Save 按钮：直接触发当前活跃的保存动作"""
