@@ -46,6 +46,69 @@ def generate_raster_circle(xc, yc, R, direction, step_len, line_spacing):
     ]
 
 
+def _curve_points_by_arclength(start, stop, spacing, point_at):
+    """Sample a parameter interval by the arc length of ``point_at(t)``.
+
+    A short, dense polyline is used only to build the length-to-parameter
+    conversion.  The returned points are then uniformly spaced on that curve
+    (with the far end included), rather than uniformly spaced in its projected
+    coordinate.
+    """
+    if spacing <= 0:
+        raise ValueError("step_len and line_spacing must be positive")
+    span = abs(stop - start)
+    count = max(128, int(np.ceil(span / spacing)) * 16 + 1)
+    t_fine = np.linspace(start, stop, count)
+    xyz = np.asarray([point_at(float(t)) for t in t_fine], dtype=float)
+    lengths = np.concatenate(([0.0], np.cumsum(np.linalg.norm(np.diff(xyz, axis=0), axis=1))))
+    if lengths[-1] < 1e-12:
+        return np.array([start], dtype=float)
+    targets = np.arange(0.0, lengths[-1] + 1e-12, spacing)
+    if targets[-1] < lengths[-1] - spacing * 0.01:
+        targets = np.append(targets, lengths[-1])
+    return np.interp(targets, lengths, t_fine)
+
+
+def generate_surface_raster(x_min, x_max, y_min, y_max, direction,
+                            step_len, line_spacing, z_at, keep=None):
+    """Generate a raster whose row and in-row samples use surface arc length.
+
+    ``z_at(x, y)`` defines a Monge surface.  The grid is first created over its
+    complete aperture, then ``keep`` may crop it to a local projected region.
+    This deliberately preserves the phase of the complete-coverage grid for
+    every local coverage mode.
+    """
+    if x_min >= x_max or y_min >= y_max:
+        raise ValueError("surface raster bounds are invalid")
+
+    if direction == "X":
+        rows = _curve_points_by_arclength(
+            y_min, y_max, line_spacing, lambda y: (0.0, y, z_at(0.0, y)))
+    else:
+        rows = _curve_points_by_arclength(
+            x_min, x_max, line_spacing, lambda x: (x, 0.0, z_at(x, 0.0)))
+
+    points = []
+    for index, fixed in enumerate(rows):
+        if direction == "X":
+            moving = _curve_points_by_arclength(
+                x_min, x_max, step_len,
+                lambda x: (x, fixed, z_at(x, fixed)))
+            row = [(float(x), float(fixed)) for x in moving]
+        else:
+            moving = _curve_points_by_arclength(
+                y_min, y_max, step_len,
+                lambda y: (float(fixed), y, z_at(fixed, y)))
+            row = [(float(fixed), float(y)) for y in moving]
+        if index % 2:
+            row.reverse()
+        if keep is None:
+            points.extend(row)
+        else:
+            points.extend((x, y) for x, y in row if keep(x, y))
+    return points
+
+
 def generate_spiral_2d(pitch, arc_step, R_max, xc, yc):
     """等弧长阿基米德螺旋线二维点
     细分步长固定为 0.005 弧度，与 trajectory 中的 MATLAB 版本一致。

@@ -1,4 +1,7 @@
-  OCC — 可以用，前提是 pythonocc-core 在你机器上已经装了（师兄的软件能跑说明装了）。但把 OCC 的 Viewer 嵌进你的 Qt
+Set-executionpolicy -scope currrentuser remotesigned 
+ numpy PyQt5
+conda-forge pythonocc-core openpyxl
+OCC — 可以用，前提是 pythonocc-core 在你机器上已经装了（师兄的软件能跑说明装了）。但把 OCC 的 Viewer 嵌进你的 Qt
   窗口需要写一套 QtViewer 集成代码，比较麻烦。
 
   igl — 不适合。igl 是网格处理库（算法向量、曲率），不是可视化库，没有渲染窗口，不能用来显示点。

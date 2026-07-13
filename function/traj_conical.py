@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """锥面轨迹（凸锥/凹锥，全覆盖/矩形/圆形，含法向量）"""
 import numpy as np
-from ._traj_common import generate_raster_rect, generate_spiral_2d
+from ._traj_common import generate_surface_raster, generate_spiral_2d
 
 
 def generate_conical(cone_type=1, alpha_deg=30.0, H=50.0,
@@ -22,9 +22,11 @@ def generate_conical(cone_type=1, alpha_deg=30.0, H=50.0,
     def z_cone(r):
         return (H - r / tan_a) if cone_type == 1 else (r / tan_a)
 
-    def in_bound(x, y):
+    def in_full_aperture(x, y):
         r = np.hypot(x, y)
-        if r > R_base + 1e-6: return False
+        return r <= R_base + 1e-6
+
+    def in_local(x, y):
         if cover_type == 2:
             return rect_xmin - 1e-6 <= x <= rect_xmax + 1e-6 and rect_ymin - 1e-6 <= y <= rect_ymax + 1e-6
         if cover_type == 3:
@@ -33,27 +35,26 @@ def generate_conical(cone_type=1, alpha_deg=30.0, H=50.0,
 
     if cover_type == 1:
         xmn, xmx, ymn, ymx = -R_base, R_base, -R_base, R_base
-        xc_sp, yc_sp, R_sp = 0.0, 0.0, R_base
     elif cover_type == 2:
         if rect_xmin >= rect_xmax or rect_ymin >= rect_ymax:
             raise ValueError("矩形覆盖范围参数无效")
-        xmn, xmx, ymn, ymx = rect_xmin, rect_xmax, rect_ymin, rect_ymax
-        xc_sp = (rect_xmin + rect_xmax) / 2; yc_sp = (rect_ymin + rect_ymax) / 2
-        R_sp = 0.5 * np.hypot(rect_xmax - rect_xmin, rect_ymax - rect_ymin)
+        xmn, xmx, ymn, ymx = -R_base, R_base, -R_base, R_base
     else:
         if circ_R <= 0: raise ValueError("圆形覆盖半径必须为正数")
         if np.hypot(circ_xc, circ_yc) + circ_R > R_base + 1e-6:
             raise ValueError("圆形区域超出底面圆")
-        xmn = circ_xc - circ_R; xmx = circ_xc + circ_R
-        ymn = circ_yc - circ_R; ymx = circ_yc + circ_R
-        xc_sp, yc_sp, R_sp = circ_xc, circ_yc, circ_R
+        xmn, xmx, ymn, ymx = -R_base, R_base, -R_base, R_base
 
     if traj_type == "G":
-        p2d = generate_raster_rect(xmn, xmx, ymn, ymx, direction, step_len, line_spacing)
+        p2d = generate_surface_raster(
+            xmn, xmx, ymn, ymx, direction, step_len, line_spacing,
+            lambda x, y: z_cone(np.hypot(x, y)),
+            keep=lambda x, y: in_full_aperture(x, y) and in_local(x, y))
     else:
-        p2d = generate_spiral_2d(pitch, arc_step, R_sp, xc_sp, yc_sp)
+        p2d = generate_spiral_2d(pitch, arc_step, R_base, 0.0, 0.0)
 
-    p2d = [[x, y] for x, y in p2d if in_bound(x, y)]
+    if traj_type != "G":
+        p2d = [[x, y] for x, y in p2d if in_full_aperture(x, y) and in_local(x, y)]
     if not p2d:
         raise ValueError("未生成任何轨迹点，请检查参数设置")
 

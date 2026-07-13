@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """柱面轨迹（凸/凹，轴线沿X或Y，含法向量）"""
 import numpy as np
-from ._traj_common import generate_raster_rect, generate_spiral_2d
+from ._traj_common import generate_surface_raster, generate_spiral_2d
 
 
 def generate_cylindrical(R, zc=0.0, k_cut=0.0, axis_dir="Y", surf_type="C",
@@ -37,22 +37,29 @@ def generate_cylindrical(R, zc=0.0, k_cut=0.0, axis_dir="Y", surf_type="C",
         else:
             y_min_p, y_max_p = -d_max, d_max
 
+    def z_at(x, y):
+        d = x if axis_dir == "Y" else y
+        sq = np.sqrt(max(0.0, R ** 2 - d ** 2))
+        return (zc + sq) if surf_type == "C" else (zc - sq)
+
+    # The circular projected region is a crop from a complete rectangular
+    # aperture trajectory, so its point phase remains identical to full cover.
+    if proj_shape == "C":
+        if axis_dir == "Y":
+            x_min_p, x_max_p = -d_max, d_max
+        else:
+            y_min_p, y_max_p = -d_max, d_max
+    in_local = (lambda x, y: True) if proj_shape != "C" else (
+        lambda x, y: x ** 2 + y ** 2 <= eff_R ** 2 + 1e-6)
     if traj_type == "G":
-        p2d = generate_raster_rect(x_min_p, x_max_p, y_min_p, y_max_p, direction, step_len, line_spacing)
-        if proj_shape == "C":
-            p2d = [[x, y] for x, y in p2d if x ** 2 + y ** 2 <= eff_R ** 2 + 1e-6]
+        p2d = generate_surface_raster(
+            x_min_p, x_max_p, y_min_p, y_max_p, direction,
+            step_len, line_spacing, z_at, keep=in_local)
     else:
-        if proj_shape == "C":
-            R_sp, xc_sp, yc_sp = eff_R, 0.0, 0.0
-        else:
-            R_sp = np.hypot(max(abs(x_min_p), abs(x_max_p)), max(abs(y_min_p), abs(y_max_p)))
-            xc_sp, yc_sp = 0.0, 0.0
-        p2d = generate_spiral_2d(pitch, arc_step, R_sp, xc_sp, yc_sp)
-        if proj_shape == "C":
-            p2d = [[x, y] for x, y in p2d if x ** 2 + y ** 2 <= eff_R ** 2 + 1e-6]
-        else:
-            p2d = [[x, y] for x, y in p2d
-                   if x_min_p <= x <= x_max_p and y_min_p <= y <= y_max_p]
+        R_sp = np.hypot(max(abs(x_min_p), abs(x_max_p)), max(abs(y_min_p), abs(y_max_p)))
+        raw = generate_spiral_2d(pitch, arc_step, R_sp, 0.0, 0.0)
+        p2d = [[x, y] for x, y in raw
+               if x_min_p <= x <= x_max_p and y_min_p <= y <= y_max_p and in_local(x, y)]
     if not p2d:
         raise ValueError("未生成任何轨迹点，请检查参数设置")
 
@@ -61,8 +68,7 @@ def generate_cylindrical(R, zc=0.0, k_cut=0.0, axis_dir="Y", surf_type="C",
         d = x if axis_dir == "Y" else y
         if abs(d) > d_max + 1e-6:
             continue
-        sq = np.sqrt(max(0.0, R ** 2 - d ** 2))
-        z_abs = (zc + sq) if surf_type == "C" else (zc - sq)
+        z_abs = z_at(x, y)
         if surf_type == "C" and z_abs < k_cut - 1e-6: continue
         if surf_type == "V" and z_abs > k_cut + 1e-6: continue
         z_rel = z_abs - z0_new

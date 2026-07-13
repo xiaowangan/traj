@@ -91,6 +91,8 @@ def _generate_spherical_raster(R, r_proj, direction, step_len, line_spacing,
     行内方向：moving 轴上以 R*cos(u)*Δβ 为间距（球面真实弧长 = step_len）。
     """
     # 求"行"轴（direction=X 时行平行 X 轴 → 行轴 = Y）允许的整体范围
+    original_cover_type = cover_type
+    cover_type = 1
     if direction == "X":
         # 行 y 范围由球冠 (|y| ≤ r_proj) 与 cover 在 y 维上的范围相交决定
         if cover_type == 1:
@@ -168,7 +170,14 @@ def _generate_spherical_raster(R, r_proj, direction, step_len, line_spacing,
                 points.append([float(moving), float(fixed)])
             else:
                 points.append([float(fixed), float(moving)])
-    return points
+    if original_cover_type == 1:
+        return points
+    if original_cover_type == 2:
+        return [[x, y] for x, y in points
+                if rect_xmin - 1e-6 <= x <= rect_xmax + 1e-6 and
+                rect_ymin - 1e-6 <= y <= rect_ymax + 1e-6]
+    return [[x, y] for x, y in points
+            if (x - circ_xc) ** 2 + (y - circ_yc) ** 2 <= circ_R ** 2 + 1e-6]
 
 
 def generate_spherical(R, zc=0.0, surf_type="convex", h=None,
@@ -234,6 +243,8 @@ def generate_spherical(R, zc=0.0, surf_type="convex", h=None,
             R_sp = float(circ_R)
         if R_sp < 1e-9:
             raise ValueError("螺旋线最大半径为零，请检查覆盖范围")
+        # Local spiral coverage is filtered from the full-cap spiral as well.
+        R_sp, xc_sp, yc_sp = r_proj, 0.0, 0.0
         raw = generate_spiral_2d(pitch, arc_step, R_sp, xc_sp, yc_sp)
         p2d = []
         r_proj2 = r_proj * r_proj + 1e-6
