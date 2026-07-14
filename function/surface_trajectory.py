@@ -5,14 +5,16 @@
 输出格式：每点 [X, Y, Z, Nx, Ny, Nz]
 """
 from .traj_aspherical  import generate_aspherical
-from .traj_spherical   import generate_spherical
-from .traj_cylindrical import generate_cylindrical
+from .traj_spherical   import generate_spherical, SPHERICAL_WALL_THICKNESS_MM
+from .traj_cylindrical import generate_cylindrical, CYLINDRICAL_WALL_THICKNESS_MM
 from .traj_conical     import generate_conical
 
 __all__ = [
     "generate_aspherical",
     "generate_spherical",
+    "SPHERICAL_WALL_THICKNESS_MM",
     "generate_cylindrical",
+    "CYLINDRICAL_WALL_THICKNESS_MM",
     "generate_conical",
     "save_surface_trajectory_txt",
 ]

@@ -9,6 +9,9 @@ import numpy as np
 from ._traj_common import generate_spiral_2d
 
 
+SPHERICAL_WALL_THICKNESS_MM = 0.5
+
+
 def _angle_values(start, stop, step):
     if stop < start:
         return np.array([])
@@ -187,21 +190,30 @@ def generate_spherical(R, zc=0.0, surf_type="convex", h=None,
                        cover_type=1,
                        rect_xmin=0.0, rect_xmax=0.0,
                        rect_ymin=0.0, rect_ymax=0.0,
-                       circ_R=0.0, circ_xc=0.0, circ_yc=0.0):
+                       circ_R=0.0, circ_xc=0.0, circ_yc=0.0,
+                       wall_thickness=SPHERICAL_WALL_THICKNESS_MM):
     if R <= 0:
         raise ValueError("球体半径R必须为正数")
     if h is None or h <= 0 or h > 2 * R:
         raise ValueError(f"球冠高度 h 必须在 (0, 2R={2*R:.4f}] 范围内")
 
+    work_R = float(R)
     if surf_type == "convex":
         z_cut = zc + R - h
         r_proj = float(np.sqrt(max(0.0, R ** 2 - (z_cut - zc) ** 2)))
         z_min_region, z_max_region = z_cut, zc + R
     else:
+        if wall_thickness <= 0 or wall_thickness >= R:
+            raise ValueError("凹球面固定厚度必须满足 0 < t < R")
+        work_R = float(R - wall_thickness)
         z_cut = zc - R
         z_top = z_cut + h
-        r_proj = float(np.sqrt(max(0.0, R ** 2 - (z_top - zc) ** 2)))
-        z_min_region, z_max_region = z_cut, z_top
+        if abs(z_top - zc) >= work_R - 1e-12:
+            raise ValueError(
+                f"凹球面厚度 t={wall_thickness:.4f} mm 时，球冠高度 h 必须在 "
+                f"({wall_thickness:.4f}, {2 * R - wall_thickness:.4f}) 内")
+        r_proj = float(np.sqrt(max(0.0, work_R ** 2 - (z_top - zc) ** 2)))
+        z_min_region, z_max_region = zc - work_R, z_top
 
     if r_proj < 1e-9:
         raise ValueError("投影圆半径为零，请调整 h 值")
@@ -226,7 +238,7 @@ def generate_spherical(R, zc=0.0, surf_type="convex", h=None,
     # ---- 生成 2D 投影点 ----
     if traj_type == "G":
         p2d = _generate_spherical_raster(
-            R, r_proj, direction, step_len, line_spacing,
+            work_R, r_proj, direction, step_len, line_spacing,
             cover_type,
             rect_xmin, rect_xmax, rect_ymin, rect_ymax,
             circ_R, circ_xc, circ_yc)
@@ -267,15 +279,16 @@ def generate_spherical(R, zc=0.0, surf_type="convex", h=None,
     result = []
     for x, y in p2d:
         r2 = x * x + y * y
-        sq = np.sqrt(max(0.0, R ** 2 - r2))
+        sq = np.sqrt(max(0.0, work_R ** 2 - r2))
         z_abs = (zc + sq) if surf_type == "convex" else (zc - sq)
         if not (z_min_region - 1e-6 <= z_abs <= z_max_region + 1e-6):
             continue
         z_rel = z_abs - z_cut
         if surf_type == "convex":
-            nx, ny, nz = x / R, y / R, sq / R
+            nx, ny, nz = x / work_R, y / work_R, sq / work_R
         else:
-            nx, ny, nz = -x / R, -y / R, -sq / R
+            # 内球面的加工法向朝向球心（腔体），即球半径方向的反向。
+            nx, ny, nz = -x / work_R, -y / work_R, sq / work_R
         result.append([round(x, 6), round(y, 6), round(z_rel, 6),
                        round(nx, 6), round(ny, 6), round(nz, 6)])
     return result

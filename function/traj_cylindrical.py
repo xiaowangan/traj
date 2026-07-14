@@ -4,12 +4,20 @@ import numpy as np
 from ._traj_common import generate_surface_raster, generate_spiral_2d
 
 
+CYLINDRICAL_WALL_THICKNESS_MM = 0.5
+
+
 def generate_cylindrical(R, zc=0.0, k_cut=0.0, axis_dir="Y", surf_type="C",
                           axis_min=0.0, axis_max=100.0,
                           proj_shape="R", proj_R=0.0,
                           traj_type="G", direction="X",
                           step_len=1.0, line_spacing=5.0,
-                          pitch=5.0, arc_step=1.0):
+                          pitch=5.0, arc_step=1.0,
+                          cover_type=None,
+                          rect_xmin=0.0, rect_xmax=0.0,
+                          rect_ymin=0.0, rect_ymax=0.0,
+                          circ_R=0.0, circ_xc=0.0, circ_yc=0.0,
+                          wall_thickness=CYLINDRICAL_WALL_THICKNESS_MM):
     if R <= 0:
         raise ValueError("圆柱半径R必须为正数")
     if axis_min >= axis_max:
@@ -17,40 +25,62 @@ def generate_cylindrical(R, zc=0.0, k_cut=0.0, axis_dir="Y", surf_type="C",
     delta_z = k_cut - zc
     if abs(delta_z) > R:
         raise ValueError("切割平面与柱面无交线，请调整 k 或 R")
-    d_max = np.sqrt(R ** 2 - delta_z ** 2)
+    work_R = float(R)
+    if surf_type == "V":
+        if wall_thickness <= 0 or wall_thickness >= R:
+            raise ValueError("凹柱面固定厚度必须满足 0 < t < R")
+        work_R = float(R - wall_thickness)
+        if abs(delta_z) >= work_R - 1e-12:
+            raise ValueError(
+                f"凹柱面厚度 t={wall_thickness:.4f} mm 时，切割平面必须与内加工柱面相交")
+    d_max = np.sqrt(work_R ** 2 - delta_z ** 2)
     z0_new = k_cut if surf_type == "C" else (zc - R)
 
     if axis_dir == "Y":
         y_min_p, y_max_p = axis_min, axis_max
-        if proj_shape == "C":
-            if proj_R <= 0: raise ValueError("投影圆半径必须为正数")
-            eff_R = min(proj_R, d_max)
-            x_min_p, x_max_p = -eff_R, eff_R
-        else:
-            x_min_p, x_max_p = -d_max, d_max
+        x_min_p, x_max_p = -d_max, d_max
     else:
         x_min_p, x_max_p = axis_min, axis_max
+        y_min_p, y_max_p = -d_max, d_max
+
+    # ``proj_shape``/``proj_R`` are retained for callers using the old API.
+    # New callers use the same 1/2/3 coverage convention as the other surfaces.
+    if cover_type is None:
         if proj_shape == "C":
-            if proj_R <= 0: raise ValueError("投影圆半径必须为正数")
-            eff_R = min(proj_R, d_max)
-            y_min_p, y_max_p = -eff_R, eff_R
+            cover_type = 3
+            circ_R, circ_xc, circ_yc = float(proj_R), 0.0, 0.0
         else:
-            y_min_p, y_max_p = -d_max, d_max
+            cover_type = 1
+    if cover_type not in (1, 2, 3):
+        raise ValueError("cover_type 必须为 1/2/3")
+    if cover_type == 2:
+        if rect_xmin >= rect_xmax or rect_ymin >= rect_ymax:
+            raise ValueError("矩形覆盖范围参数无效")
+        if (rect_xmin > x_max_p or rect_xmax < x_min_p or
+                rect_ymin > y_max_p or rect_ymax < y_min_p):
+            raise ValueError("矩形覆盖区域与柱面投影区域无交集")
+    elif cover_type == 3:
+        if circ_R <= 0:
+            raise ValueError("圆形覆盖半径必须为正数")
+        nearest_x = min(max(circ_xc, x_min_p), x_max_p)
+        nearest_y = min(max(circ_yc, y_min_p), y_max_p)
+        if np.hypot(circ_xc - nearest_x, circ_yc - nearest_y) > circ_R + 1e-6:
+            raise ValueError("圆形覆盖区域与柱面投影区域无交集")
 
     def z_at(x, y):
         d = x if axis_dir == "Y" else y
-        sq = np.sqrt(max(0.0, R ** 2 - d ** 2))
+        sq = np.sqrt(max(0.0, work_R ** 2 - d ** 2))
         return (zc + sq) if surf_type == "C" else (zc - sq)
 
-    # The circular projected region is a crop from a complete rectangular
-    # aperture trajectory, so its point phase remains identical to full cover.
-    if proj_shape == "C":
-        if axis_dir == "Y":
-            x_min_p, x_max_p = -d_max, d_max
-        else:
-            y_min_p, y_max_p = -d_max, d_max
-    in_local = (lambda x, y: True) if proj_shape != "C" else (
-        lambda x, y: x ** 2 + y ** 2 <= eff_R ** 2 + 1e-6)
+    if cover_type == 1:
+        in_local = lambda x, y: True
+    elif cover_type == 2:
+        in_local = lambda x, y: (
+            rect_xmin - 1e-6 <= x <= rect_xmax + 1e-6 and
+            rect_ymin - 1e-6 <= y <= rect_ymax + 1e-6)
+    else:
+        in_local = lambda x, y: (
+            (x - circ_xc) ** 2 + (y - circ_yc) ** 2 <= circ_R ** 2 + 1e-6)
     if traj_type == "G":
         p2d = generate_surface_raster(
             x_min_p, x_max_p, y_min_p, y_max_p, direction,

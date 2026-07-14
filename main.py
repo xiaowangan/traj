@@ -39,8 +39,8 @@ from function.planar_trajectory import (
     generate_planar_raster, generate_planar_spiral, save_trajectory_txt
 )
 from function.surface_trajectory import (
-    generate_aspherical, generate_spherical,
-    generate_cylindrical, generate_conical,
+    generate_aspherical, generate_spherical, SPHERICAL_WALL_THICKNESS_MM,
+    generate_cylindrical, CYLINDRICAL_WALL_THICKNESS_MM, generate_conical,
     save_surface_trajectory_txt
 )
 from function.license_manager   import get_hardware_id, activate, verify_license
@@ -233,11 +233,12 @@ class PreviewCanvas(QWidget):
             BRepBuilderAPI_MakeVertex,
         )
         from OCC.Core.BRepPrimAPI import BRepPrimAPI_MakeSphere
+        from OCC.Core.AIS import AIS_TextLabel, AIS_Triangulation
+        from OCC.Core.Poly import Poly_Triangle, Poly_Triangulation
         from OCC.Extend.DataExchange import read_stl_file
-        from OCC.Core.gp import gp_Pnt
+        from OCC.Core.gp import gp_Ax3, gp_Cylinder, gp_Dir, gp_Pnt, gp_Sphere
         from OCC.Core.Quantity import Quantity_Color, Quantity_TOC_RGB
         from OCC.Core.TopoDS import TopoDS_Compound
-        from OCC.Core.AIS import AIS_TextLabel
         return {
             "qtViewer3d": qtViewer3d,
             "BRep_Builder": BRep_Builder,
@@ -246,8 +247,15 @@ class PreviewCanvas(QWidget):
             "BRepBuilderAPI_MakePolygon": BRepBuilderAPI_MakePolygon,
             "BRepBuilderAPI_MakeVertex": BRepBuilderAPI_MakeVertex,
             "BRepPrimAPI_MakeSphere": BRepPrimAPI_MakeSphere,
+            "AIS_Triangulation": AIS_Triangulation,
+            "Poly_Triangle": Poly_Triangle,
+            "Poly_Triangulation": Poly_Triangulation,
             "read_stl_file": read_stl_file,
             "gp_Pnt": gp_Pnt,
+            "gp_Ax3": gp_Ax3,
+            "gp_Cylinder": gp_Cylinder,
+            "gp_Dir": gp_Dir,
+            "gp_Sphere": gp_Sphere,
             "Quantity_Color": Quantity_Color,
             "Quantity_TOC_RGB": Quantity_TOC_RGB,
             "TopoDS_Compound": TopoDS_Compound,
@@ -382,7 +390,8 @@ class PreviewCanvas(QWidget):
         except Exception:
             return None
 
-    def _display_shapes(self, display, shapes, color=None, update=False):
+    def _display_shapes(self, display, shapes, color=None, update=False,
+                        hide_face_boundaries=False):
         if not shapes:
             return
         compound = self._make_compound(shapes)
@@ -404,6 +413,13 @@ class PreviewCanvas(QWidget):
                     display.Context.SetDisplayMode(ais, 1, False)
                     if display_color is not None and not isinstance(display_color, str):
                         display.Context.SetColor(ais, display_color, False)
+                    if hide_face_boundaries:
+                        drawer = ais.Attributes()
+                        drawer.SetFaceBoundaryDraw(False)
+                        drawer.SetWireDraw(False)
+                        drawer.SetupOwnShadingAspect()
+                        drawer.ShadingAspect().Aspect().SetEdgeOff()
+                        display.Context.Redisplay(ais, False)
             display.Context.UpdateCurrentViewer()
         except Exception:
             pass
@@ -417,6 +433,121 @@ class PreviewCanvas(QWidget):
             return occ["Quantity_Color"](float(r), float(g), float(b), occ["Quantity_TOC_RGB"])
         except Exception:
             return color
+
+    def _display_surface_direct_overlay(self, display, points,
+                                        break_long_edges=False, geom=None):
+        """Display a narrow, depth-tested 3-D ribbon following the trajectory."""
+        segments = self._trajectory_segments(
+            points, max_edges=60000, break_long_edges=break_long_edges)
+        if display is None or not segments:
+            return False
+        try:
+            occ = self._occ_imports()
+            nodes = []
+            normals = []
+            triangles = []
+            span = np.ptp(np.asarray([point[:3] for point in points], dtype=float),
+                          axis=0)
+            half_width = max(float(np.max(span)) * 1.5e-3, 0.18)
+            for p1, p2 in segments:
+                if not self._cylindrical_overlay_segment_visible(
+                        p1, p2, geom, half_width):
+                    continue
+                xyz1 = np.asarray(p1[:3], dtype=float)
+                xyz2 = np.asarray(p2[:3], dtype=float)
+                tangent = xyz2 - xyz1
+                tangent_length = float(np.linalg.norm(tangent))
+                if tangent_length <= 1.0e-9:
+                    continue
+                tangent /= tangent_length
+                n1 = np.asarray(p1[3:6], dtype=float)
+                n2 = np.asarray(p2[3:6], dtype=float)
+                n1 /= max(float(np.linalg.norm(n1)), 1.0e-12)
+                n2 /= max(float(np.linalg.norm(n2)), 1.0e-12)
+                side1 = np.cross(n1, tangent)
+                side2 = np.cross(n2, tangent)
+                side1 /= max(float(np.linalg.norm(side1)), 1.0e-12)
+                side2 /= max(float(np.linalg.norm(side2)), 1.0e-12)
+                if float(np.dot(side1, side2)) < 0.0:
+                    side2 = -side2
+                first = len(nodes) + 1
+                nodes.extend((
+                    xyz1 + half_width * side1,
+                    xyz1 - half_width * side1,
+                    xyz2 + half_width * side2,
+                    xyz2 - half_width * side2,
+                ))
+                normals.extend((n1, n1, n2, n2))
+                triangles.extend((
+                    (first, first + 1, first + 2),
+                    (first + 1, first + 3, first + 2),
+                ))
+            if not triangles:
+                return False
+
+            mesh = occ["Poly_Triangulation"](
+                len(nodes), len(triangles), False, True)
+            for index, (node, normal) in enumerate(zip(nodes, normals), 1):
+                mesh.SetNode(index, occ["gp_Pnt"](
+                    float(node[0]), float(node[1]), float(node[2])))
+                mesh.SetNormal(index, occ["gp_Dir"](
+                    float(normal[0]), float(normal[1]), float(normal[2])))
+            for index, triangle in enumerate(triangles, 1):
+                mesh.SetTriangle(index, occ["Poly_Triangle"](*triangle))
+
+            ribbon = occ["AIS_Triangulation"](mesh)
+            blue = occ["Quantity_Color"](
+                0.0, 0.0, 1.0, occ["Quantity_TOC_RGB"])
+            drawer = ribbon.Attributes()
+            drawer.SetupOwnShadingAspect()
+            drawer.ShadingAspect().SetColor(blue)
+            ribbon_aspect = drawer.ShadingAspect().Aspect()
+            ribbon_aspect.AllowBackFace()
+            display.Context.Display(ribbon, False)
+            display.Context.SetDisplayMode(ribbon, 0, False)
+            display.Context.UpdateCurrentViewer()
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def _cylindrical_overlay_segment_visible(p1, p2, geom, half_width):
+        """Hide only raster row transfers that run along the cylinder rim."""
+        if not (geom and geom.get("type") == "cylindrical" and
+                geom.get("surf_type", "C") == "V"):
+            return True
+        radius = abs(float(geom.get("R", 0.0)))
+        thickness = abs(float(geom.get(
+            "wall_thickness", CYLINDRICAL_WALL_THICKNESS_MM)))
+        work_radius = radius - thickness
+        axis_index = 1 if geom.get("axis_dir", "Y") == "Y" else 0
+        cross_index = 0 if axis_index == 1 else 1
+
+        delta_z = float(geom.get("k_cut", 0.0)) - float(
+            geom.get("zc", 0.0))
+        if work_radius <= 0.0 or abs(delta_z) >= work_radius:
+            return True
+        opening_angle = float(np.arccos(
+            np.clip(abs(delta_z) / work_radius, 0.0, 1.0)))
+        z_center = float(geom.get("zc", 0.0))
+        z_origin = z_center - radius
+        rim_gaps = []
+        for point in (p1, p2):
+            cross = abs(float(point[cross_index]))
+            z_abs = float(point[2]) + z_origin
+            theta = float(np.arctan2(cross, max(z_center - z_abs, 0.0)))
+            rim_gaps.append(max(0.0, opening_angle - theta) * work_radius)
+
+        # A serpentine row transfer changes only the cylinder-axis coordinate
+        # while both endpoints remain on the same opening lip.  Do not remove
+        # a real scan segment merely because one endpoint touches the lip.
+        axis_delta = abs(float(p2[axis_index]) - float(p1[axis_index]))
+        cross_delta = abs(float(p2[cross_index]) - float(p1[cross_index]))
+        rim_tolerance = max(float(half_width), thickness)
+        is_rim_transfer = (
+            max(rim_gaps) <= rim_tolerance and
+            axis_delta > 1.0e-9 and cross_delta <= 1.0e-6)
+        return not is_rim_transfer
 
     def _fit_display(self, display, view="iso"):
         if display is None:
@@ -487,33 +618,90 @@ class PreviewCanvas(QWidget):
         except Exception:
             pass
 
-    def _trajectory_shapes(self, points, max_points=60000, max_edges=60000, break_long_edges=False):
+    def _trajectory_shapes(self, points, max_points=0, max_edges=60000, break_long_edges=False):
         if not points:
             return [], []
         n_pts = len(points)
-        stride_pts = max(1, int(np.ceil(n_pts / max_points)))
-        pts = [points[i] for i in range(0, n_pts, stride_pts)]
-        point_shapes = [self._point_shape(p[0], p[1], p[2]) for p in pts]
+        point_shapes = []
+        if max_points > 0:
+            stride_pts = max(1, int(np.ceil(n_pts / max_points)))
+            pts = [points[i] for i in range(0, n_pts, stride_pts)]
+            point_shapes = [self._point_shape(p[0], p[1], p[2]) for p in pts]
 
-        edge_shapes = []
-        if n_pts > 1 and max_edges > 0:
-            stride_edges = max(1, int(np.ceil((n_pts - 1) / max_edges)))
-            line_pts = [points[i] for i in range(0, n_pts, stride_edges)]
-            if line_pts[-1] is not points[-1]:
-                line_pts.append(points[-1])
-            break_limit = self._trajectory_break_limit(line_pts) if break_long_edges else None
-            for p1, p2 in zip(line_pts, line_pts[1:]):
-                if break_limit is not None:
-                    dist = np.linalg.norm(np.array(p1[:3], dtype=float) - np.array(p2[:3], dtype=float))
-                    if dist > break_limit:
-                        continue
-                edge_shapes.append(self._edge_shape(p1, p2))
+        edge_shapes = [self._edge_shape(p1, p2) for p1, p2 in
+                       self._trajectory_segments(
+                           points, max_edges=max_edges,
+                           break_long_edges=break_long_edges)]
         return point_shapes, edge_shapes
+
+    def _trajectory_segments(self, points, max_edges=60000,
+                             break_long_edges=False):
+        if len(points) < 2 or max_edges <= 0:
+            return []
+        stride = max(1, int(np.ceil((len(points) - 1) / max_edges)))
+        line_points = [points[index] for index in range(0, len(points), stride)]
+        if line_points[-1] is not points[-1]:
+            line_points.append(points[-1])
+        break_limit = self._trajectory_break_limit(
+            line_points) if break_long_edges else None
+        segments = []
+        for p1, p2 in zip(line_points, line_points[1:]):
+            distance = np.linalg.norm(
+                np.asarray(p1[:3], dtype=float) -
+                np.asarray(p2[:3], dtype=float))
+            if distance <= 1.0e-9:
+                continue
+            if break_limit is not None and distance > break_limit:
+                continue
+            segments.append((p1, p2))
+        return segments
+
+    @staticmethod
+    def _surface_overlay_points(points, geom):
+        """Lift display-only surface trajectories to avoid depth-buffer flicker."""
+        surface_types = {"spherical", "aspherical", "cylindrical", "conical"}
+        if not (geom and geom.get("type") in surface_types):
+            return points
+        xyz = np.asarray([point[:3] for point in points], dtype=float)
+        max_span = float(np.max(np.ptp(xyz, axis=0))) if len(xyz) else 0.0
+        clearance = max(max_span * 5.0e-3, 0.02)
+
+        if geom.get("type") == "spherical":
+            radius = abs(float(geom.get("R", 0.0)))
+            thickness = abs(float(geom.get(
+                "wall_thickness", SPHERICAL_WALL_THICKNESS_MM)))
+            clearance = min(max(radius * 2.0e-3, 0.02),
+                            max(thickness * 0.40, 0.02))
+            if geom.get("surf_type", "convex") == "concave":
+                clearance = max(
+                    clearance,
+                    min(max(radius * 1.0e-2, 0.02),
+                        max(thickness * 2.0, 0.02)))
+        elif (geom.get("type") == "cylindrical" and
+              geom.get("surf_type", "C") == "V"):
+            thickness = abs(float(geom.get(
+                "wall_thickness", CYLINDRICAL_WALL_THICKNESS_MM)))
+            clearance = max(thickness * 0.90, 0.02)
+        lifted = []
+        for point in points:
+            if len(point) < 6:
+                lifted.append(point)
+                continue
+            item = list(point)
+            item[0] = float(item[0]) + clearance * float(point[3])
+            item[1] = float(item[1]) + clearance * float(point[4])
+            item[2] = float(item[2]) + clearance * float(point[5])
+            lifted.append(item)
+        return lifted
 
     @staticmethod
     def _should_break_long_edges(params):
         traj_name = str(params.get("traj_name", ""))
-        return params.get("traj_type") == "S" or "螺旋" in traj_name or "Spiral" in traj_name
+        if params.get("traj_type") == "S" or "螺旋" in traj_name or "Spiral" in traj_name:
+            return True
+        geom = params.get("geom") or {}
+        return (geom.get("type") == "cylindrical" and
+                int(geom.get("cover_type", 1)) in (2, 3))
 
     def _trajectory_break_limit(self, points):
         if len(points) < 4:
@@ -664,25 +852,54 @@ class PreviewCanvas(QWidget):
         self._set_label(self._label_traj, traj_label)
 
         geom = params.get("geom")
-        surface_shapes = self._surface_shapes_from_geom(params.get("geom"))
-        point_shapes, edge_shapes = self._trajectory_shapes(
-            points, max_points=60000, max_edges=60000,
-            break_long_edges=self._should_break_long_edges(params))
+        surface_shapes = self._surface_shapes_from_geom(geom)
+        hide_surface_boundaries = bool(
+            geom and geom.get("type") in {
+                "spherical", "aspherical", "cylindrical", "conical"})
+        display_points = self._surface_overlay_points(points, geom) if overlay else points
+        direct_surface_overlay = bool(
+            overlay and geom and geom.get("type") in {
+                "spherical", "aspherical", "cylindrical", "conical"})
+        if direct_surface_overlay:
+            point_shapes, edge_shapes = [], []
+        else:
+            point_shapes, edge_shapes = self._trajectory_shapes(
+                display_points, max_points=0, max_edges=60000,
+                break_long_edges=self._should_break_long_edges(params))
 
         if overlay:
             if surface_shapes:
-                self._display_shapes(self._display_traj, surface_shapes, color=(0.35, 0.42, 0.50), update=False)
-            self._display_shapes(self._display_traj, edge_shapes, color="BLUE", update=False)
-            self._display_shapes(self._display_traj, point_shapes, color="BLUE", update=False)
-            self._draw_scene_axes(self._display_traj, points, include_z=True, geom=geom)
+                self._display_shapes(
+                    self._display_traj, surface_shapes,
+                    color=(0.35, 0.42, 0.50), update=False,
+                    hide_face_boundaries=hide_surface_boundaries)
+            surface_direct = bool(
+                direct_surface_overlay and
+                self._display_surface_direct_overlay(
+                    self._display_traj, display_points,
+                    break_long_edges=self._should_break_long_edges(params),
+                    geom=geom))
+            if not surface_direct:
+                if direct_surface_overlay:
+                    point_shapes, edge_shapes = self._trajectory_shapes(
+                        display_points, max_points=0, max_edges=60000,
+                        break_long_edges=self._should_break_long_edges(params))
+                self._display_shapes(
+                    self._display_traj, edge_shapes, color="BLUE", update=False)
+                self._display_shapes(
+                    self._display_traj, point_shapes, color="BLUE", update=False)
             radius = self._marker_radius(points)
-            self._display_shapes(self._display_traj, [self._sphere_shape(points[0], radius)], color="GREEN", update=False)
-            self._display_shapes(self._display_traj, [self._sphere_shape(points[-1], radius)], color="RED", update=True)
+            self._display_shapes(self._display_traj, [self._sphere_shape(display_points[0], radius)], color="GREEN", update=False)
+            self._display_shapes(self._display_traj, [self._sphere_shape(display_points[-1], radius)], color="RED", update=False)
+            self._draw_scene_axes(self._display_traj, points, include_z=True, geom=geom)
             self._fit_display(self._display_traj, view="iso")
             return
 
         if surface_shapes:
-            self._display_shapes(self._display_surf, surface_shapes, color=(0.35, 0.42, 0.50), update=True)
+            self._display_shapes(
+                self._display_surf, surface_shapes,
+                color=(0.35, 0.42, 0.50), update=True,
+                hide_face_boundaries=hide_surface_boundaries)
         else:
             surf_point_shapes, _ = self._trajectory_shapes(points, max_points=12000, max_edges=0)
             self._display_shapes(self._display_surf, surf_point_shapes, color="BLUE", update=True)
@@ -782,24 +999,105 @@ class PreviewCanvas(QWidget):
         return shapes
 
     def _sample_spherical_surface(self, geom):
-        R = float(geom["R"]); zc = float(geom.get("zc", 0.0))
-        h = float(geom["h"]); st = geom.get("surf_type", "convex")
-        if st == "convex":
-            z_cut = zc + R - h
-            r_proj = np.sqrt(max(0.0, R * R - (z_cut - zc) ** 2))
-            z0 = z_cut; sign = 1.0
-        else:
-            z_cut = zc - R
-            z_top = z_cut + h
-            r_proj = np.sqrt(max(0.0, R * R - (z_top - zc) ** 2))
-            z0 = z_cut; sign = -1.0
+        parts = self._spherical_surface_parts(geom)
+        return parts["all_shapes"] if parts else []
 
-        u = np.linspace(0, 2 * np.pi, 49)
-        v = np.linspace(max(r_proj / 28.0, 1e-6), r_proj, 28)
-        U, V = np.meshgrid(u, v)
-        X = V * np.cos(U); Y = V * np.sin(U)
-        Z = zc + sign * np.sqrt(np.maximum(0.0, R * R - X * X - Y * Y)) - z0
-        return self._grid_faces(X, Y, Z)
+    def _make_spherical_face(self, center_z, radius, v_min, v_max, reverse=False):
+        occ = self._occ_imports()
+        axis = occ["gp_Ax3"](
+            occ["gp_Pnt"](0.0, 0.0, float(center_z)),
+            occ["gp_Dir"](0.0, 0.0, 1.0),
+        )
+        sphere = occ["gp_Sphere"](axis, float(radius))
+        face = occ["BRepBuilderAPI_MakeFace"](
+            sphere, 0.0, 2.0 * np.pi, float(v_min), float(v_max)).Face()
+        return face.Reversed() if reverse else face
+
+    def _make_spherical_rim(self, r_outer, r_inner, z_value, samples=96):
+        shapes = []
+        for index in range(samples):
+            a0 = 2.0 * np.pi * index / samples
+            a1 = 2.0 * np.pi * (index + 1) / samples
+            outer0 = (r_outer * np.cos(a0), r_outer * np.sin(a0), z_value)
+            outer1 = (r_outer * np.cos(a1), r_outer * np.sin(a1), z_value)
+            inner0 = (r_inner * np.cos(a0), r_inner * np.sin(a0), z_value)
+            inner1 = (r_inner * np.cos(a1), r_inner * np.sin(a1), z_value)
+            for tri in ((outer0, outer1, inner1), (outer0, inner1, inner0)):
+                face = self._face_shape(tri)
+                if face is not None:
+                    shapes.append(face)
+        return shapes
+
+    def _spherical_surface_parts(self, geom):
+        R = float(geom["R"])
+        h = float(geom["h"])
+        st = geom.get("surf_type", "convex")
+        if R <= 0:
+            return None
+
+        if st == "convex":
+            center_z = h - R
+            v_min = float(np.arcsin(np.clip((R - h) / R, -1.0, 1.0)))
+            outer_face = self._make_spherical_face(
+                center_z, R, v_min, np.pi / 2.0, reverse=False)
+            thickness = float(geom.get(
+                "wall_thickness", SPHERICAL_WALL_THICKNESS_MM))
+            inner_R = R - thickness
+            opening_from_center = R - h
+            r_outer = float(np.sqrt(max(0.0, R * R - opening_from_center ** 2)))
+            if inner_R > 0.0 and abs(opening_from_center) < inner_R:
+                v_inner = float(np.arcsin(np.clip(
+                    opening_from_center / inner_R, -1.0, 1.0)))
+                inner_face = self._make_spherical_face(
+                    center_z, inner_R, v_inner, np.pi / 2.0, reverse=True)
+                r_inner = float(np.sqrt(max(
+                    0.0, inner_R * inner_R - opening_from_center ** 2)))
+                occluders = [inner_face] + self._make_spherical_rim(
+                    r_outer, r_inner, 0.0)
+            else:
+                # 极浅或接近整球的球冠没有内球开口，以平面底盖封闭厚壳。
+                occluders = self._make_spherical_rim(r_outer, 0.0, 0.0)
+            return {
+                "all_shapes": [outer_face] + occluders,
+                "occluder_shapes": occluders,
+                "work_face": outer_face,
+                "work_radius": R,
+                "center_z": center_z,
+                "v_min": v_min,
+                "v_max": np.pi / 2.0,
+            }
+
+        thickness = float(geom.get(
+            "wall_thickness", SPHERICAL_WALL_THICKNESS_MM))
+        work_R = R - thickness
+        if work_R <= 0:
+            return None
+        center_z = R
+        opening_from_center = h - R
+        if abs(opening_from_center) >= work_R:
+            return None
+
+        v_outer = float(np.arcsin(np.clip(opening_from_center / R, -1.0, 1.0)))
+        v_inner = float(np.arcsin(np.clip(opening_from_center / work_R, -1.0, 1.0)))
+        outer_face = self._make_spherical_face(
+            center_z, R, -np.pi / 2.0, v_outer, reverse=False)
+        inner_face = self._make_spherical_face(
+            center_z, work_R, -np.pi / 2.0, v_inner, reverse=True)
+
+        r_outer = float(np.sqrt(max(0.0, R * R - opening_from_center ** 2)))
+        r_inner = float(np.sqrt(max(0.0, work_R * work_R - opening_from_center ** 2)))
+        rim_shapes = self._make_spherical_rim(r_outer, r_inner, h)
+
+        occluders = [outer_face] + rim_shapes
+        return {
+            "all_shapes": occluders + [inner_face],
+            "occluder_shapes": occluders,
+            "work_face": inner_face,
+            "work_radius": work_R,
+            "center_z": center_z,
+            "v_min": -np.pi / 2.0,
+            "v_max": v_inner,
+        }
 
     def _sample_aspherical_surface(self, geom):
         R = float(geom["R"]); k = float(geom.get("k", 0.0))
@@ -818,37 +1116,150 @@ class PreviewCanvas(QWidget):
                 z += coef * r2 ** idx
             return z
 
-        bt = int(geom.get("bound_type", 1))
-        if bt == 1:
-            W = float(geom.get("full_width", 0.0)); L = float(geom.get("full_length", 0.0))
-            xs = np.linspace(-W / 2, W / 2, 36); ys = np.linspace(-L / 2, L / 2, 36)
-            X, Y = np.meshgrid(xs, ys); Z = asp_z(X, Y)
-        elif bt == 2:
-            xs = np.linspace(float(geom["rect_xmin"]), float(geom["rect_xmax"]), 36)
-            ys = np.linspace(float(geom["rect_ymin"]), float(geom["rect_ymax"]), 36)
-            X, Y = np.meshgrid(xs, ys); Z = asp_z(X, Y)
-        else:
-            cR = float(geom["circ_R"]); cxc = float(geom.get("circ_xc", 0.0)); cyc = float(geom.get("circ_yc", 0.0))
-            u = np.linspace(0, 2 * np.pi, 49); v = np.linspace(max(cR / 28.0, 1e-6), cR, 28)
-            U, V = np.meshgrid(u, v)
-            X = cxc + V * np.cos(U); Y = cyc + V * np.sin(U); Z = asp_z(X, Y)
+        # Local bounds crop only the trajectory.  The preview always shows the
+        # complete aspherical aperture defined by full_width/full_length.
+        W = float(geom.get("full_width", 0.0))
+        L = float(geom.get("full_length", 0.0))
+        xs = np.linspace(-W / 2, W / 2, 36)
+        ys = np.linspace(-L / 2, L / 2, 36)
+        X, Y = np.meshgrid(xs, ys)
+        Z = asp_z(X, Y)
         return self._grid_faces(X, Y, Z)
 
     def _sample_cylindrical_surface(self, geom):
-        R = float(geom["R"]); zc = float(geom.get("zc", 0.0))
-        kcut = float(geom.get("k_cut", zc - R)); axis_dir = geom.get("axis_dir", "Y")
-        st = geom.get("surf_type", "C"); amin = float(geom["axis_min"]); amax = float(geom["axis_max"])
-        d_max = np.sqrt(max(0.0, R * R - (kcut - zc) ** 2))
-        d = np.linspace(-d_max, d_max, 36); axis = np.linspace(amin, amax, 36)
-        D, A = np.meshgrid(d, axis)
+        R = float(geom["R"])
+        zc = float(geom.get("zc", 0.0))
+        kcut = float(geom.get("k_cut", zc - R))
+        axis_dir = geom.get("axis_dir", "Y")
+        st = geom.get("surf_type", "C")
+        amin = float(geom["axis_min"])
+        amax = float(geom["axis_max"])
+        thickness = float(geom.get(
+            "wall_thickness", CYLINDRICAL_WALL_THICKNESS_MM))
+        inner_R = R - thickness
+        delta_z = kcut - zc
+        outer_dmax = np.sqrt(max(0.0, R * R - delta_z * delta_z))
         sign = 1.0 if st == "C" else -1.0
         z0 = kcut if st == "C" else zc - R
-        Z = zc + sign * np.sqrt(np.maximum(0.0, R * R - D * D)) - z0
-        if axis_dir == "Y":
-            X, Y = D, A
-        else:
-            X, Y = A, D
-        return self._grid_faces(X, Y, Z)
+        axis = np.linspace(amin, amax, 36)
+
+        if st == "V" and inner_R > 0.0 and abs(delta_z) < inner_R:
+            # Match the concave-sphere preview: use exact OCC surfaces for the
+            # two working walls.  A coarse faceted cylinder does not reliably
+            # occlude a trajectory on the far/outside half of a thin shell.
+            occ = self._occ_imports()
+            if axis_dir == "Y":
+                cylinder_axis = occ["gp_Ax3"](
+                    occ["gp_Pnt"](0.0, amin, R),
+                    occ["gp_Dir"](0.0, 1.0, 0.0),
+                    occ["gp_Dir"](1.0, 0.0, 0.0))
+            else:
+                cylinder_axis = occ["gp_Ax3"](
+                    occ["gp_Pnt"](amin, 0.0, R),
+                    occ["gp_Dir"](1.0, 0.0, 0.0),
+                    occ["gp_Dir"](0.0, -1.0, 0.0))
+
+            length = amax - amin
+
+            def cylinder_face(radius, reverse=False):
+                edge_angle = float(np.arcsin(np.clip(
+                    -delta_z / radius, -1.0, 1.0)))
+                face = occ["BRepBuilderAPI_MakeFace"](
+                    occ["gp_Cylinder"](cylinder_axis, radius),
+                    edge_angle, np.pi - edge_angle, 0.0, length).Face()
+                return face.Reversed() if reverse else face
+
+            inner_dmax = np.sqrt(max(
+                0.0, inner_R * inner_R - delta_z * delta_z))
+            shapes = [
+                cylinder_face(R),
+                cylinder_face(inner_R, reverse=True),
+            ]
+
+            # Close both opening lips between the outer shell and inner face.
+            opening_z = kcut - z0
+            for side in (-1.0, 1.0):
+                D = np.column_stack((
+                    np.full_like(axis, side * outer_dmax),
+                    np.full_like(axis, side * inner_dmax),
+                ))
+                A = np.column_stack((axis, axis))
+                Z = np.full_like(D, opening_z)
+                if axis_dir == "Y":
+                    X, Y = D, A
+                else:
+                    X, Y = A, D
+                shapes.extend(self._grid_faces(X, Y, Z))
+
+            # Close the two longitudinal ends of the 0.5 mm shell.
+            u = np.linspace(-1.0, 1.0, 96)
+            d_outer = outer_dmax * u
+            d_inner = inner_dmax * u
+            z_outer = (zc - np.sqrt(np.maximum(
+                0.0, R * R - d_outer * d_outer)) - z0)
+            z_inner = (zc - np.sqrt(np.maximum(
+                0.0, inner_R * inner_R - d_inner * d_inner)) - z0)
+            D = np.vstack((d_outer, d_inner))
+            Z = np.vstack((z_outer, z_inner))
+            for axis_value in (amin, amax):
+                A = np.full_like(D, axis_value)
+                if axis_dir == "Y":
+                    X, Y = D, A
+                else:
+                    X, Y = A, D
+                shapes.extend(self._grid_faces(X, Y, Z))
+            return shapes
+
+        def cylinder_grid(radius, dmax):
+            d = np.linspace(-dmax, dmax, 36)
+            D, A = np.meshgrid(d, axis)
+            Z = (zc + sign * np.sqrt(
+                np.maximum(0.0, radius * radius - D * D)) - z0)
+            if axis_dir == "Y":
+                return D, A, Z
+            return A, D, Z
+
+        shapes = self._grid_faces(*cylinder_grid(R, outer_dmax))
+        if inner_R <= 0.0 or abs(delta_z) >= inner_R:
+            return shapes
+
+        inner_dmax = np.sqrt(max(
+            0.0, inner_R * inner_R - delta_z * delta_z))
+        shapes.extend(self._grid_faces(*cylinder_grid(inner_R, inner_dmax)))
+
+        # Close both opening lips between the outer shell and inner work face.
+        opening_z = kcut - z0
+        for side in (-1.0, 1.0):
+            D = np.column_stack((
+                np.full_like(axis, side * outer_dmax),
+                np.full_like(axis, side * inner_dmax),
+            ))
+            A = np.column_stack((axis, axis))
+            Z = np.full_like(D, opening_z)
+            if axis_dir == "Y":
+                X, Y = D, A
+            else:
+                X, Y = A, D
+            shapes.extend(self._grid_faces(X, Y, Z))
+
+        # Close the two longitudinal ends so the preview is a 0.5 mm shell.
+        u = np.linspace(-1.0, 1.0, 36)
+        d_outer = outer_dmax * u
+        d_inner = inner_dmax * u
+        z_outer = (zc + sign * np.sqrt(np.maximum(
+            0.0, R * R - d_outer * d_outer)) - z0)
+        z_inner = (zc + sign * np.sqrt(np.maximum(
+            0.0, inner_R * inner_R - d_inner * d_inner)) - z0)
+        D = np.vstack((d_outer, d_inner))
+        Z = np.vstack((z_outer, z_inner))
+        for axis_value in (amin, amax):
+            A = np.full_like(D, axis_value)
+            if axis_dir == "Y":
+                X, Y = D, A
+            else:
+                X, Y = A, D
+            shapes.extend(self._grid_faces(X, Y, Z))
+        return shapes
 
     def _sample_conical_surface(self, geom):
         ctype = int(geom.get("cone_type", 1)); alpha = np.radians(float(geom["alpha_deg"]))
@@ -2066,7 +2477,8 @@ class ControlPanel(QStackedWidget):
                           traj_type=traj, direction=dire,
                           step_len=step_len, line_spacing=line_spacing,
                           pitch=pitch, arc_step=arc_step,
-                          cover_type=cover)
+                          cover_type=cover,
+                          wall_thickness=SPHERICAL_WALL_THICKNESS_MM)
             if cover == 2:
                 kwargs.update(rect_xmin=f(self.sph_edt_rxmin, "X_min"),
                               rect_xmax=f(self.sph_edt_rxmax, "X_max"),
@@ -2088,7 +2500,8 @@ class ControlPanel(QStackedWidget):
         surf_cn = "凸球面" if surf == "convex" else "凹球面"
         geom = {"type": "spherical",
                 "R": R, "zc": zc, "h": h, "surf_type": surf,
-                "cover_type": cover}
+                "cover_type": cover,
+                "wall_thickness": SPHERICAL_WALL_THICKNESS_MM}
         if cover == 2:
             geom.update(rect_xmin=kwargs["rect_xmin"], rect_xmax=kwargs["rect_xmax"],
                         rect_ymin=kwargs["rect_ymin"], rect_ymax=kwargs["rect_ymax"])
@@ -2132,15 +2545,41 @@ class ControlPanel(QStackedWidget):
             g1.addLayout(row)
         layout.addWidget(grp1)
 
-        grp2 = QGroupBox("投影区域")
-        g2 = QVBoxLayout(grp2)
-        self.cyl_cmb_proj = QComboBox()
-        self.cyl_cmb_proj.addItems(["矩形投影区域", "圆形投影区域"])
-        combox_input(g2, "投影形状：", self.cyl_cmb_proj)
-        self.cyl_edt_projR, row_pR = lineedit_input("圆形投影半径 (mm)：", "50")
-        self.cyl_wrap_projR = QWidget(); self.cyl_wrap_projR.setLayout(row_pR)
-        g2.addWidget(self.cyl_wrap_projR)
-        layout.addWidget(grp2)
+        grp_cv = QGroupBox("覆盖范围")
+        gcv = QVBoxLayout(grp_cv)
+        self.cyl_cmb_cover = QComboBox()
+        self.cyl_cmb_cover.addItems([
+            "全部覆盖（完整柱面投影区域）",
+            "局部矩形区域",
+            "局部圆形区域",
+        ])
+        combox_input(gcv, "覆盖类型：", self.cyl_cmb_cover)
+
+        self.cyl_lbl_rect = QLabel("── 矩形区域参数 ──")
+        gcv.addWidget(self.cyl_lbl_rect)
+        self.cyl_edt_rxmin, row_rxn = lineedit_input("X_min (mm)：", "-50")
+        self.cyl_edt_rxmax, row_rxx = lineedit_input("X_max (mm)：",  "50")
+        self.cyl_edt_rymin, row_ryn = lineedit_input("Y_min (mm)：", "-50")
+        self.cyl_edt_rymax, row_ryx = lineedit_input("Y_max (mm)：",  "50")
+        self.cyl_wrap_rect = QWidget()
+        wr = QVBoxLayout(self.cyl_wrap_rect)
+        wr.setContentsMargins(0, 0, 0, 0); wr.setSpacing(2)
+        for row in [row_rxn, row_rxx, row_ryn, row_ryx]:
+            wr.addLayout(row)
+        gcv.addWidget(self.cyl_wrap_rect)
+
+        self.cyl_lbl_circ = QLabel("── 圆形区域参数 ──")
+        gcv.addWidget(self.cyl_lbl_circ)
+        self.cyl_edt_cR,  row_cR  = lineedit_input("圆形半径 (mm)：", "50")
+        self.cyl_edt_cxc, row_cxc = lineedit_input("圆心 X (mm)：",   "0")
+        self.cyl_edt_cyc, row_cyc = lineedit_input("圆心 Y (mm)：",   "0")
+        self.cyl_wrap_circ = QWidget()
+        wc = QVBoxLayout(self.cyl_wrap_circ)
+        wc.setContentsMargins(0, 0, 0, 0); wc.setSpacing(2)
+        for row in [row_cR, row_cxc, row_cyc]:
+            wc.addLayout(row)
+        gcv.addWidget(self.cyl_wrap_circ)
+        layout.addWidget(grp_cv)
 
         grp3 = QGroupBox("轨迹参数")
         g3 = QVBoxLayout(grp3)
@@ -2183,12 +2622,12 @@ class ControlPanel(QStackedWidget):
         layout.addStretch()
 
         self.cyl_cmb_traj.currentIndexChanged.connect(self._cyl_traj_changed)
-        self.cyl_cmb_proj.currentIndexChanged.connect(self._cyl_proj_changed)
+        self.cyl_cmb_cover.currentIndexChanged.connect(self._cyl_cover_changed)
         self.cyl_btn_gen.clicked.connect(self._do_generate_cylindrical)
         self.cyl_btn_save.clicked.connect(
             lambda: self._do_save("柱面轨迹", self.cyl_edt_fname.text(), is_surface=True))
         self._cyl_traj_changed()
-        self._cyl_proj_changed()
+        self._cyl_cover_changed()
         return scroll
 
     def _cyl_traj_changed(self):
@@ -2199,9 +2638,14 @@ class ControlPanel(QStackedWidget):
         self.cyl_edt_pitch.setVisible(False)
         self.cyl_edt_arcstep.setVisible(False)
 
-    def _cyl_proj_changed(self):
-        is_circ = (self.cyl_cmb_proj.currentIndex() == 1)
-        self.cyl_wrap_projR.setVisible(is_circ)
+    def _cyl_cover_changed(self):
+        idx = self.cyl_cmb_cover.currentIndex()
+        show_rect = (idx == 1)
+        show_circ = (idx == 2)
+        self.cyl_lbl_rect.setVisible(show_rect)
+        self.cyl_wrap_rect.setVisible(show_rect)
+        self.cyl_lbl_circ.setVisible(show_circ)
+        self.cyl_wrap_circ.setVisible(show_circ)
 
     def _do_generate_cylindrical(self):
         def f(e, n):
@@ -2215,34 +2659,52 @@ class ControlPanel(QStackedWidget):
             amax  = f(self.cyl_edt_amax, "轴线终点")
             axis  = "Y" if self.cyl_cmb_axis.currentIndex() == 0 else "X"
             surf  = "C" if self.cyl_cmb_type.currentIndex() == 0 else "V"
-            proj  = "R" if self.cyl_cmb_proj.currentIndex() == 0 else "C"
-            proj_R = f(self.cyl_edt_projR, "投影圆半径") if proj == "C" else 0.0
+            cover = self.cyl_cmb_cover.currentIndex() + 1
             traj  = "G" if self.cyl_cmb_traj.currentIndex() == 0 else "S"
             dire  = "X" if self.cyl_cmb_dir.currentIndex()  == 0 else "Y"
             step_len, line_spacing, pitch, arc_step = self._read_surface_step_spacing(
                 self.cyl_ctrl_step, self.cyl_ctrl_spacing)
+            coverage = {"cover_type": cover}
+            if cover == 2:
+                coverage.update(
+                    rect_xmin=f(self.cyl_edt_rxmin, "X_min"),
+                    rect_xmax=f(self.cyl_edt_rxmax, "X_max"),
+                    rect_ymin=f(self.cyl_edt_rymin, "Y_min"),
+                    rect_ymax=f(self.cyl_edt_rymax, "Y_max"))
+            elif cover == 3:
+                coverage.update(
+                    circ_R=f(self.cyl_edt_cR, "圆形半径"),
+                    circ_xc=f(self.cyl_edt_cxc, "圆心X"),
+                    circ_yc=f(self.cyl_edt_cyc, "圆心Y"))
         except ValueError as e:
             QMessageBox.warning(self._main, "参数错误", str(e)); return
         try:
             pts = generate_cylindrical(R=R, zc=zc, k_cut=k_cut,
                                        axis_dir=axis, surf_type=surf,
                                        axis_min=amin, axis_max=amax,
-                                       proj_shape=proj, proj_R=proj_R,
                                        traj_type=traj, direction=dire,
                                        step_len=step_len, line_spacing=line_spacing,
-                                       pitch=pitch, arc_step=arc_step)
+                                       pitch=pitch, arc_step=arc_step,
+                                       wall_thickness=CYLINDRICAL_WALL_THICKNESS_MM,
+                                       **coverage)
         except ValueError as e:
             QMessageBox.warning(self._main, "生成失败", str(e)); return
         if not pts:
             QMessageBox.warning(self._main, "警告", "未生成任何轨迹点"); return
         tname = "栅形" if traj == "G" else "螺旋线"
         surf_cn = "凸柱面" if surf == "C" else "凹柱面"
+        geom = {"type": "cylindrical",
+                "R": R, "zc": zc, "k_cut": k_cut,
+                "axis_dir": axis, "surf_type": surf,
+                "axis_min": amin, "axis_max": amax,
+                "cover_type": cover,
+                "wall_thickness": CYLINDRICAL_WALL_THICKNESS_MM}
+        geom.update(coverage)
         params = {"surface_name": surf_cn, "traj_name": tname + "轨迹",
-                  "geom": {"type": "cylindrical",
-                           "R": R, "zc": zc, "k_cut": k_cut,
-                           "axis_dir": axis, "surf_type": surf,
-                           "axis_min": amin, "axis_max": amax,
-                           "proj_shape": proj, "proj_R": proj_R}}
+                  "traj_type": traj, "direction": dire,
+                  "step_len": step_len, "line_spacing": line_spacing,
+                  "pitch": pitch, "arc_step": arc_step,
+                  "geom": geom}
         self._finish(pts, params, self.cyl_btn_save, self.cyl_info_lbl,
                      f"{surf_cn}{tname}轨迹", is_surface=True)
 
