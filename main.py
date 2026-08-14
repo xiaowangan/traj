@@ -35,15 +35,12 @@ from GUI.Icons import get_icon
 from GUI.StyleSheets import get_stylesheet
 
 # ── 本模块 ──────────────────────────────────────────────────────────
-from function.planar_trajectory import (
-    generate_planar_raster, generate_planar_spiral, save_trajectory_txt
-)
 from function.surface_trajectory import (
-    generate_aspherical, generate_spherical, SPHERICAL_WALL_THICKNESS_MM,
-    generate_cylindrical, CYLINDRICAL_WALL_THICKNESS_MM, generate_conical,
-    save_surface_trajectory_txt
+    SPHERICAL_WALL_THICKNESS_MM, CYLINDRICAL_WALL_THICKNESS_MM
 )
 from function.license_manager   import get_hardware_id, activate, verify_license
+from trajectory_planning import TrajectoryPlanningMixin
+from dwell_time import DwellTimeMixin
 
 
 
@@ -74,6 +71,102 @@ def divider():
 
 
 # ════════════════════════════════════════════════════════════════════
+# 面形数据二维热力图预览（左=处理前原始面形，右=处理后面形，各带一条色标）
+# ════════════════════════════════════════════════════════════════════
+def _downsample_2d(data, max_side=1536):
+    """大图按整数步长抽稀，避免超大干涉图拖慢 matplotlib 渲染。"""
+    data = np.asarray(data, dtype=float)
+    stride = 1
+    while max(data.shape) / stride > max_side:
+        stride += 1
+    return data if stride == 1 else data[::stride, ::stride]
+
+
+class SurfaceDataPreview(QWidget):
+    """用两个独立 matplotlib 面板分别显示处理前/处理后面形热力图（仿轨迹规划的左右面板）。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setStyleSheet("background-color: #dfe9f5;")
+        self._error = None
+        self._colorbars = []
+        self._axes = []
+        self._canvases = []
+        self._panel_hosts = []
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(4, 4, 4, 4)
+        outer.setSpacing(0)
+
+        panels = QHBoxLayout()
+        panels.setContentsMargins(0, 0, 0, 0)
+        panels.setSpacing(2)
+
+        try:
+            import matplotlib
+            from matplotlib.figure import Figure
+            from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg
+            for _ in range(2):
+                host = QWidget()
+                host_layout = QVBoxLayout(host)
+                host_layout.setContentsMargins(0, 0, 0, 0)
+                figure = Figure(figsize=(3.6, 3.6), dpi=100)
+                figure.patch.set_facecolor("#dfe9f5")
+                canvas = FigureCanvasQTAgg(figure)
+                canvas.setStyleSheet("background-color: #dfe9f5;")
+                axis = figure.add_subplot(111)
+                axis.set_facecolor("#dfe9f5")
+                figure.subplots_adjust(
+                    left=0.03, right=0.80, top=0.97, bottom=0.03)
+                host_layout.addWidget(canvas)
+                self._axes.append(axis)
+                self._canvases.append(canvas)
+                self._panel_hosts.append(host)
+                panels.addWidget(host, 1)
+        except Exception as exc:
+            self._error = exc
+            hint = QLabel(
+                "二维图显示需要 matplotlib。请安装后重启软件。\n\n" + str(exc))
+            hint.setAlignment(Qt.AlignCenter)
+            hint.setWordWrap(True)
+            hint.setStyleSheet("color:#c0392b; font-size:14px;")
+            outer.addWidget(hint)
+            return
+
+        outer.addLayout(panels, 1)
+
+    def set_data(self, raw, processed):
+        if self._error is not None:
+            return
+        for cb in self._colorbars:
+            try:
+                cb.remove()
+            except Exception:
+                pass
+        self._colorbars = []
+        try:
+            import matplotlib
+            cmap = matplotlib.colormaps.get_cmap("jet").copy()
+            cmap.set_bad("#d6e2f0")
+        except Exception:
+            cmap = "jet"
+        for ax, data in zip(self._axes, (raw, processed)):
+            ax.clear()
+            ax.set_facecolor("#dfe9f5")
+            ax.set_xticks([])
+            ax.set_yticks([])
+            im = ax.imshow(_downsample_2d(data), cmap=cmap, aspect="equal",
+                           interpolation="nearest", origin="lower")
+            cb = ax.figure.colorbar(im, ax=ax, fraction=0.05, pad=0.05)
+            cb.set_label("面形误差 (nm)", color="#10243f", fontsize=9)
+            cb.ax.tick_params(labelsize=8, colors="#10243f")
+            cb.outline.set_edgecolor("#10243f")
+            self._colorbars.append(cb)
+        for canvas in self._canvases:
+            canvas.draw_idle()
+
+
+# ════════════════════════════════════════════════════════════════════
 # 预览画布（左侧中央区域）
 # ════════════════════════════════════════════════════════════════════
 class PreviewCanvas(QWidget):
@@ -101,8 +194,44 @@ class PreviewCanvas(QWidget):
         self._surface_view_mode = "split"
         self._surf_box = None
         self._traj_box = None
+        self._surface_data_preview = None
+        self._idx_surface_data = -1
+
+        # 驻留时间功能介绍横幅：仿照 Trajectory 覆盖条的独立横条纹，
+        # 显示在左侧预览区最上方（仅驻留时间页面激活时出现）。
+        self._label_dwell = QLabel(self)
+        self._label_dwell.setAlignment(Qt.AlignCenter)
+        self._label_dwell.setWordWrap(True)
+        self._label_dwell.setStyleSheet(
+            "QLabel {"
+            "background-color: #d6e2f0;"
+            "color: #10243f;"
+            "font-family: Microsoft YaHei, SimHei, Arial;"
+            "font-size: 13px;"
+            "font-weight: 700;"
+            "padding: 3px 8px;"
+            "border-bottom: 1px solid #b8c7d8;"
+            "}"
+        )
+        self._label_dwell.hide()
+
+        # 面形数据第二横条：处理前 / 处理后，位于介绍横幅下方，
+        # 与左右两个热力图面板对齐。样式复用 _make_overlay_label，
+        # 与建模/轨迹的“曲面 | …”“Trajectory | …”覆盖条完全一致。
+        self._label_dwell_sub_left = None
+        self._label_dwell_sub_right = None
 
         self._init_occ_widgets()
+        self._init_surface_data_widget()
+
+    def _init_surface_data_widget(self):
+        self._surface_data_preview = SurfaceDataPreview(self)
+        self._idx_surface_data = self._stack.count()
+        self._stack.addWidget(self._surface_data_preview)
+        hosts = getattr(self._surface_data_preview, "_panel_hosts", [])
+        if len(hosts) >= 2:
+            self._label_dwell_sub_left = self._make_overlay_label(hosts[0])
+            self._label_dwell_sub_right = self._make_overlay_label(hosts[1])
 
     def _init_occ_widgets(self):
         try:
@@ -202,11 +331,51 @@ class PreviewCanvas(QWidget):
         QtCore.QTimer.singleShot(0, self._sync_all_occ_views)
 
     def _place_overlay_labels(self):
+        offset = 0
+        if self._label_dwell is not None and self._label_dwell.isVisible():
+            width = max(1, self.width())
+            height = max(30, self._label_dwell.heightForWidth(width))
+            self._label_dwell.setGeometry(0, 0, width, height)
+            self._label_dwell.raise_()
+            offset = height
         for host, label in self._label_hosts:
             if host is None or label is None:
                 continue
-            label.setGeometry(0, 0, max(1, host.width()), 30)
+            label.setGeometry(0, offset, max(1, host.width()), 30)
             label.raise_()
+
+    def set_dwell_banner(self, text):
+        self._label_dwell.setText(text)
+        self._label_dwell.show()
+        self._place_overlay_labels()
+
+    def clear_dwell_banner(self):
+        if self._label_dwell.isVisible():
+            self._label_dwell.hide()
+            self._place_overlay_labels()
+
+    def set_dwell_sub_bar(self, left_text="处理前", right_text="处理后", visible=True):
+        """面形数据页面的第二横条：左/右面板上方的“处理前/处理后”说明。"""
+        if self._label_dwell_sub_left is not None:
+            self._label_dwell_sub_left.setText(left_text)
+            self._label_dwell_sub_left.setVisible(visible)
+        if self._label_dwell_sub_right is not None:
+            self._label_dwell_sub_right.setText(right_text)
+            self._label_dwell_sub_right.setVisible(visible)
+        self._place_overlay_labels()
+
+    def hide_dwell_sub_bar(self):
+        left_visible = (self._label_dwell_sub_left is not None and
+                        self._label_dwell_sub_left.isVisible())
+        right_visible = (self._label_dwell_sub_right is not None and
+                         self._label_dwell_sub_right.isVisible())
+        if not (left_visible or right_visible):
+            return
+        if self._label_dwell_sub_left is not None:
+            self._label_dwell_sub_left.hide()
+        if self._label_dwell_sub_right is not None:
+            self._label_dwell_sub_right.hide()
+        self._place_overlay_labels()
 
     def _sync_all_occ_views(self):
         for display in (self._display2d, self._display_surf, self._display_traj):
@@ -808,6 +977,7 @@ class PreviewCanvas(QWidget):
 
     def plot(self, points, params):
         self._stack.setCurrentIndex(0)
+        self.hide_dwell_sub_bar()
         QApplication.processEvents()
         if self._occ_error is not None:
             return
@@ -833,6 +1003,7 @@ class PreviewCanvas(QWidget):
     def plot_surface(self, points, params):
         self._stack.setCurrentIndex(1)
         self._apply_surface_view_mode()
+        self.hide_dwell_sub_bar()
         QApplication.processEvents()
         if self._occ_error is not None:
             return
@@ -914,9 +1085,106 @@ class PreviewCanvas(QWidget):
         self._display_shapes(self._display_traj, [self._sphere_shape(points[-1], radius)], color="RED", update=True)
         self._fit_display(self._display_traj, view="iso")
 
+    def plot_dwell_surface(self, raw, processed, raw_title="处理前", processed_title="处理后"):
+        """驻留时间面形数据：左侧处理前原始面形，右侧处理后面形，二维热力图。"""
+        if self._surface_data_preview is None:
+            return
+        self._stack.setCurrentIndex(self._idx_surface_data)
+        QApplication.processEvents()
+        self._surface_data_preview.set_data(raw, processed)
+        self.set_dwell_sub_bar(raw_title, processed_title, True)
+
+    def plot_dwell_model(self, model, surface_name):
+        """驻留时间建模：把模型点云以带法向着色的三角网格显示在左侧单个面板。"""
+        self._stack.setCurrentIndex(1)
+        self.hide_dwell_sub_bar()
+        QApplication.processEvents()
+        if self._occ_error is not None:
+            return
+        mesh = self._dwell_model_mesh(model)
+        if mesh is None:
+            self._show_hint(self._display_surf, "模型没有可显示的有效节点")
+            return
+        # 建模只显示一个曲面面板，不需要左右两栏；轨迹规划调用 plot_surface 时恢复。
+        if self._surf_box is not None and self._traj_box is not None:
+            self._surf_box.setVisible(True)
+            self._traj_box.setVisible(False)
+        self._clear_display(self._display_surf)
+        self._clear_display(self._display_traj)
+        self._set_label(self._label_surf, f"曲面 | {surface_name}")
+        self._display_triangulation(self._display_surf, mesh)
+        self._fit_display(self._display_surf, view="iso")
+
+    def _dwell_model_mesh(self, model):
+        """由建模点云构建 Poly_Triangulation；口径外无效节点跳过，过大网格降采样。"""
+        occ = self._occ_imports()
+        points = np.asarray(model["points"], dtype=float)
+        normals = np.asarray(model["normals"], dtype=float)
+        mask = np.asarray(model["mask"], dtype=bool)
+        mask &= np.isfinite(points).all(axis=-1)
+        rows, cols = points.shape[:2]
+        stride = 1
+        while (((rows + stride - 1) // stride) * ((cols + stride - 1) // stride)) > 40000:
+            stride += 1
+        rs = list(range(0, rows, stride)); cs = list(range(0, cols, stride))
+        if rs[-1] != rows - 1:
+            rs.append(rows - 1)
+        if cs[-1] != cols - 1:
+            cs.append(cols - 1)
+        nodes = []; node_normals = []; index = {}
+        for i, r in enumerate(rs):
+            for j, c in enumerate(cs):
+                if not mask[r, c]:
+                    continue
+                index[(i, j)] = len(nodes) + 1
+                nodes.append(points[r, c])
+                normal = np.nan_to_num(normals[r, c])
+                norm = float(np.linalg.norm(normal))
+                if norm < 1e-9:
+                    normal = np.array((0.0, 0.0, 1.0))
+                else:
+                    normal = normal / norm
+                node_normals.append(normal)
+        triangles = []
+        for i in range(len(rs) - 1):
+            for j in range(len(cs) - 1):
+                a = index.get((i, j)); b = index.get((i, j + 1))
+                d = index.get((i + 1, j)); e = index.get((i + 1, j + 1))
+                if a and b and e:
+                    triangles.append((a, b, e))
+                if a and e and d:
+                    triangles.append((a, e, d))
+        if not nodes or not triangles:
+            return None
+        mesh = occ["Poly_Triangulation"](len(nodes), len(triangles), False, True)
+        for idx, (node, normal) in enumerate(zip(nodes, node_normals), 1):
+            mesh.SetNode(idx, occ["gp_Pnt"](
+                float(node[0]), float(node[1]), float(node[2])))
+            mesh.SetNormal(idx, occ["gp_Dir"](
+                float(normal[0]), float(normal[1]), float(normal[2])))
+        for idx, tri in enumerate(triangles, 1):
+            mesh.SetTriangle(idx, occ["Poly_Triangle"](*tri))
+        return mesh
+
+    def _display_triangulation(self, display, mesh, color=(0.35, 0.42, 0.50)):
+        if display is None:
+            return
+        occ = self._occ_imports()
+        ais = occ["AIS_Triangulation"](mesh)
+        drawer = ais.Attributes()
+        drawer.SetupOwnShadingAspect()
+        drawer.ShadingAspect().SetColor(self._occ_color(color))
+        drawer.ShadingAspect().Aspect().AllowBackFace()
+        display.Context.Display(ais, False)
+        # 模式 1（法向着色）在部分 GL 驱动下不渲染三角网格，
+        # 沿用轨迹带验证过的模式 0。
+        display.Context.SetDisplayMode(ais, 0, False)
+        display.Context.UpdateCurrentViewer()
+
     def import_stl_to_shape(self, path):
         self._stack.setCurrentIndex(1)
         self._apply_surface_view_mode()
+        self.hide_dwell_sub_bar()
         QApplication.processEvents()
         if self._occ_error is not None:
             raise RuntimeError(str(self._occ_error))
@@ -1270,7 +1538,7 @@ class PreviewCanvas(QWidget):
         Z = H - V / tan_a if ctype == 1 else V / tan_a
         return self._grid_faces(X, Y, Z)
 
-class ControlPanel(QStackedWidget):
+class ControlPanel(TrajectoryPlanningMixin, DwellTimeMixin, QStackedWidget):
     """
     仿照师兄软件：QDockWidget 里放 QStackedWidget，
     每个功能对应一个 page，Ribbon 按钮切换页面。
@@ -1279,6 +1547,7 @@ class ControlPanel(QStackedWidget):
         super().__init__(parent)
         self._main = parent          # MainWindow 引用，用于访问 preview/statusbar
         self._surface_control_pairs = []
+        self._init_dwell_state()
 
         # 记录各页面索引
         self.idx_blank   = self.count()
@@ -1286,6 +1555,20 @@ class ControlPanel(QStackedWidget):
 
         self.idx_license = self.count()
         self.addWidget(self._build_license_page())
+
+        # 驻留时间：由 appCNCFinishingV6.mlapp 的六个工作页迁移而来。
+        self.idx_dwell_initial = self.count()
+        self.addWidget(self._build_dwell_initial_page())
+        self.idx_dwell_model = self.count()
+        self.addWidget(self._build_dwell_model_page())
+        self.idx_dwell_surface = self.count()
+        self.addWidget(self._build_dwell_surface_page())
+        self.idx_dwell_spot = self.count()
+        self.addWidget(self._build_dwell_spot_page())
+        self.idx_dwell_solve = self.count()
+        self.addWidget(self._build_dwell_solve_page())
+        self.idx_dwell_cnc = self.count()
+        self.addWidget(self._build_dwell_cnc_page())
 
         # 曲面轨迹：统一入口页（下拉选择 + 子页面）
         self.idx_surface = self.count()
@@ -1295,6 +1578,27 @@ class ControlPanel(QStackedWidget):
         self._points = []
         self._params = {}
         self._last_is_surface = False
+
+        # 驻留时间：切换页面时同步左侧顶部介绍横幅（横幅文本由各驻留页面自身携带）
+        self.currentChanged.connect(self._sync_dwell_banner)
+        self._sync_dwell_banner(self.currentIndex())
+
+    def _sync_dwell_banner(self, index):
+        """驻留时间页面在左侧顶部显示介绍横条，其余页面隐藏。"""
+        widget = self.widget(index)
+        text = getattr(widget, "dwell_banner_text", None)
+        if text:
+            self._main.preview.set_dwell_banner(text)
+        else:
+            self._main.preview.clear_dwell_banner()
+        # 面形数据页：已有面形数据时显示“处理前/处理后”第二横条，其余情况隐藏。
+        has_surface = (index == self.idx_dwell_surface and
+                       self._dwell_state.get("surface_raw") is not None and
+                       self._dwell_state.get("surface") is not None)
+        if has_surface:
+            self._main.preview.set_dwell_sub_bar(visible=True)
+        else:
+            self._main.preview.hide_dwell_sub_bar()
 
     # ── 共用：保存 TXT ──────────────────────────────────────────────
     def _build_blank_page(self):
@@ -1310,62 +1614,6 @@ class ControlPanel(QStackedWidget):
         layout.addWidget(blank)
         return page
 
-    def _do_save(self, traj_name, fname_hint, is_surface=False):
-        if not self._points:
-            QMessageBox.warning(self._main, "提示", "请先生成轨迹")
-            return
-        default = (fname_hint.strip() or "trajectory") + ".txt"
-        path, _ = QFileDialog.getSaveFileName(
-            self._main, "保存轨迹文件", default, "文本文件 (*.txt)")
-        if not path:
-            return
-        try:
-            if is_surface:
-                surface_name = self._params.get("surface_name", "")
-                save_surface_trajectory_txt(self._points, path, traj_name, surface_name)
-            else:
-                shape_name = "矩形" if self._params.get("shape") == "R" else "圆形"
-                save_trajectory_txt(self._points, path, traj_name, shape_name)
-            QMessageBox.information(self._main, "保存成功",
-                f"轨迹文件已保存：\n{path}\n共 {len(self._points)} 个点")
-            self._main.statusbar.showMessage(f"已保存至 {os.path.basename(path)}")
-            self._main.set_status(f"已保存至 {os.path.basename(path)}")
-        except Exception as e:
-            QMessageBox.critical(self._main, "保存失败", str(e))
-
-    def _finish(self, points, params, save_btn, info_lbl, tname, is_surface=False):
-        self._points = points
-        self._params = params
-        self._last_is_surface = is_surface
-        if is_surface:
-            self._main.preview.plot_surface(points, params)
-        else:
-            self._main.preview.plot(points, params)
-        save_btn.setEnabled(True)
-        if is_surface:
-            info_lbl.setText(
-                f"✔ 生成完成 | {tname} | {len(points)} 个轨迹点\n"
-                f"  输出含 X Y Z Nx Ny Nz")
-        else:
-            sname = "矩形" if params.get("shape") == "R" else "圆形"
-            info_lbl.setText(
-                f"✔ 生成完成 | {sname}{tname} | {len(points)} 个轨迹点\n"
-                f"  Z=0，法向量 (0,0,1)")
-        info_lbl.setStyleSheet("color:#1a7a3c; font-size:11px;")
-        self._main.statusbar.showMessage(
-            f"{tname}生成完成，共 {len(points)} 个轨迹点")
-        # 输出到结果终端
-        self._main.set_status(f"{tname}生成完成，共 {len(points)} 个轨迹点")
-        xs = [p[0] for p in points]; ys = [p[1] for p in points]; zs = [p[2] for p in points]
-        self._main.terminal_output.appendPlainText(
-            f"[轨迹生成] {tname}，共 {len(points)} 个点\n"
-            f"  X∈[{min(xs):.3f}, {max(xs):.3f}]  "
-            f"Y∈[{min(ys):.3f}, {max(ys):.3f}]  "
-            f"Z∈[{min(zs):.3f}, {max(zs):.3f}]")
-
-    # ────────────────────────────────────────────────────────────────
-    # 授权管理页面
-    # ────────────────────────────────────────────────────────────────
     def _build_license_page(self):
         page = QWidget()
         layout = QVBoxLayout(page)
@@ -1443,1447 +1691,8 @@ class ControlPanel(QStackedWidget):
         self.lic_lbl_status.setStyleSheet(f"color:{color}; font-size:12px;")
 
     # ────────────────────────────────────────────────────────────────
-    # 共用：轨迹类型子组件（栅形/螺旋线）
+    # 驻留时间页面（由 appCNCFinishingV6.mlapp 的六个 Tab 迁移）
     # ────────────────────────────────────────────────────────────────
-    def _build_traj_group(self, prefix):
-        """返回 (grp, cmb_type, cmb_dir, edt_step, edt_spacing, edt_pitch, edt_arc)
-        无论栅形还是螺旋线，均只显示「间距」和「步长」两个输入框。
-        默认值：间距=2 mm，步长=1 mm（固定）。
-        """
-        grp = QGroupBox("轨迹参数")
-        g   = QVBoxLayout(grp)
-
-        cmb_type = QComboBox()
-        cmb_type.addItems(["栅形轨迹 (Raster)", "螺旋线轨迹 (Spiral)"])
-        combox_input(g, "轨迹类型：", cmb_type)
-
-        # 隐藏的栅形方向（保留供读取逻辑使用，不再显示）
-        cmb_dir = QComboBox()
-        cmb_dir.addItems(["平行于 X 轴（沿 Y 推进）", "平行于 Y 轴（沿 X 推进）"])
-        cmb_dir.setVisible(False)
-
-        # 统一显示：间距（上）、步长（下）
-        edt_spacing, row_sp  = lineedit_input("间距 (mm)：",  "2")
-        edt_step,    row_st  = lineedit_input("步长 (mm)：",  "1")
-        g.addLayout(row_sp)
-        g.addLayout(row_st)
-
-        # 保留 pitch/arc 对象供 _read_traj 使用，不显示
-        edt_pitch = QLineEdit("2");   edt_pitch.setVisible(False)
-        edt_arc   = QLineEdit("1");  edt_arc.setVisible(False)
-
-        def on_spacing_changed(txt):
-            edt_pitch.setText(txt)
-        def on_step_changed(txt):
-            edt_arc.setText(txt)
-
-        edt_spacing.textChanged.connect(on_spacing_changed)
-        edt_step.textChanged.connect(on_step_changed)
-
-        return grp, cmb_type, cmb_dir, edt_step, edt_spacing, edt_pitch, edt_arc
-
-    def _read_traj(self, cmb_type, cmb_dir, edt_step, edt_spacing, edt_pitch, edt_arc):
-        def f(e, n):
-            try: return float(e.text())
-            except: raise ValueError(f"参数「{n}」输入无效")
-        traj_type = "G" if cmb_type.currentIndex() == 0 else "S"
-        direction = "X" if cmb_dir.currentIndex() == 0 else "Y"
-        return dict(
-            traj_type=traj_type, direction=direction,
-            step_len=f(edt_step, "点间步长"),
-            line_spacing=f(edt_spacing, "线间距"),
-            pitch=f(edt_pitch, "螺距"),
-            arc_step=f(edt_arc, "弧长步长"),
-        )
-
-    # ────────────────────────────────────────────────────────────────
-    # 非球面轨迹页面
-    # ────────────────────────────────────────────────────────────────
-    def _build_aspherical_page(self):
-        scroll = QScrollArea(); scroll.setWidgetResizable(True)
-        w = QWidget(); scroll.setWidget(w)
-        layout = QVBoxLayout(w); layout.setSpacing(6); layout.setContentsMargins(6,6,6,6)
-
-        # ① 非球面参数
-        grp1 = QGroupBox("非球面参数")
-        g1   = QVBoxLayout(grp1)
-        self.asp_R,       r1  = lineedit_input("曲率半径 R (mm, +凸/-凹)：")
-        self.asp_k,       r2  = lineedit_input("圆锥常数 k：",         "0")
-        self.asp_A4,      r3  = lineedit_input("A4：",                  "0")
-        self.asp_A6,      r4  = lineedit_input("A6：",                  "0")
-        self.asp_A8,      r5  = lineedit_input("A8：",                  "0")
-        self.asp_A10,     r6  = lineedit_input("A10：",                 "0")
-        self.asp_A12,     r7  = lineedit_input("A12：",                 "0")
-        self.asp_A14,     r8  = lineedit_input("A14：",                 "0")
-        self.asp_off,     r9  = lineedit_input("离轴量 offcenter (mm)：", "0")
-        for r in [r1,r2,r3,r4,r5,r6,r7,r8,r9]: g1.addLayout(r)
-        layout.addWidget(grp1)
-
-        # ② 边界
-        grp2 = QGroupBox("轨迹边界")
-        g2   = QVBoxLayout(grp2)
-        self.asp_cmb_bound = QComboBox()
-        self.asp_cmb_bound.addItems(["全口径矩形", "局部矩形", "局部圆形"])
-        combox_input(g2, "边界类型：", self.asp_cmb_bound)
-
-        self.asp_W,  rW  = lineedit_input("X方向宽度 (mm)：")
-        self.asp_L,  rL  = lineedit_input("Y方向长度 (mm)：")
-        self.asp_x1, rx1 = lineedit_input("矩形 X_min (mm)：", "0")
-        self.asp_x2, rx2 = lineedit_input("矩形 X_max (mm)：", "0")
-        self.asp_y1, ry1 = lineedit_input("矩形 Y_min (mm)：", "0")
-        self.asp_y2, ry2 = lineedit_input("矩形 Y_max (mm)：", "0")
-        self.asp_cR, rcR = lineedit_input("圆形半径 (mm)：",   "0")
-        self.asp_cx, rcx = lineedit_input("圆心 X (mm)：",     "0")
-        self.asp_cy, rcy = lineedit_input("圆心 Y (mm)：",     "0")
-        for r in [rW,rL,rx1,rx2,ry1,ry2,rcR,rcx,rcy]: g2.addLayout(r)
-
-        def _asp_bound_changed(idx):
-            self.asp_W.setVisible(idx==0); self.asp_L.setVisible(idx==0)
-            for w in [self.asp_x1,self.asp_x2,self.asp_y1,self.asp_y2]:
-                w.setVisible(idx==1)
-            for w in [self.asp_cR,self.asp_cx,self.asp_cy]:
-                w.setVisible(idx==2)
-        self.asp_cmb_bound.currentIndexChanged.connect(_asp_bound_changed)
-        _asp_bound_changed(0)
-        layout.addWidget(grp2)
-
-        # ③ 轨迹参数
-        grp3, self.asp_t, self.asp_dir, self.asp_st, self.asp_sp, self.asp_pt, self.asp_arc = \
-            self._build_traj_group("asp")
-        layout.addWidget(grp3)
-
-        # ④ 输出
-        grp4 = QGroupBox("输出设置")
-        g4   = QVBoxLayout(grp4)
-        self.asp_fname, rf = lineedit_input("文件名：", "aspherical_traj")
-        g4.addLayout(rf); layout.addWidget(grp4)
-
-        btn_row = QHBoxLayout()
-        self.asp_btn_gen  = QPushButton("生成轨迹")
-        self.asp_btn_save = QPushButton("保存 TXT"); self.asp_btn_save.setEnabled(False)
-        btn_row.addWidget(self.asp_btn_gen); btn_row.addWidget(self.asp_btn_save)
-        layout.addLayout(btn_row)
-        layout.addWidget(divider())
-        self.asp_info = QLabel(""); self.asp_info.setWordWrap(True)
-        layout.addWidget(self.asp_info); layout.addStretch()
-
-        self.asp_btn_gen.clicked.connect(self._do_generate_aspherical)
-        self.asp_btn_save.clicked.connect(
-            lambda: self._do_save("非球面轨迹", self.asp_fname.text(), is_surface=True))
-        return scroll
-
-    def _do_generate_aspherical(self):
-        def f(e, n):
-            try: return float(e.text())
-            except: raise ValueError(f"参数「{n}」输入无效")
-        try:
-            tp = self._read_traj(self.asp_t, self.asp_dir, self.asp_st,
-                                  self.asp_sp, self.asp_pt, self.asp_arc)
-            bi = self.asp_cmb_bound.currentIndex()
-            p = dict(
-                R=f(self.asp_R,"曲率半径R"), k=f(self.asp_k,"k"),
-                A4=f(self.asp_A4,"A4"), A6=f(self.asp_A6,"A6"),
-                A8=f(self.asp_A8,"A8"), A10=f(self.asp_A10,"A10"),
-                A12=f(self.asp_A12,"A12"), A14=f(self.asp_A14,"A14"),
-                offcenter=f(self.asp_off,"离轴量"),
-                bound_type=bi+1,
-                full_width=f(self.asp_W,"X宽度"), full_length=f(self.asp_L,"Y长度"),
-                rect_xmin=f(self.asp_x1,"X_min"), rect_xmax=f(self.asp_x2,"X_max"),
-                rect_ymin=f(self.asp_y1,"Y_min"), rect_ymax=f(self.asp_y2,"Y_max"),
-                circ_R=f(self.asp_cR,"圆形半径"),
-                circ_xc=f(self.asp_cx,"圆心X"), circ_yc=f(self.asp_cy,"圆心Y"),
-                **tp)
-            pts = generate_aspherical(**p)
-        except ValueError as e:
-            QMessageBox.warning(self._main, "参数错误", str(e)); return
-        if not pts:
-            QMessageBox.warning(self._main, "警告", "未生成任何轨迹点"); return
-        meta = {"surface_name":"非球面", "traj_name":("栅形" if tp["traj_type"]=="G" else "螺旋线")+"轨迹"}
-        self._finish(pts, meta, self.asp_btn_save, self.asp_info, "非球面轨迹", is_surface=True)
-
-    # ────────────────────────────────────────────────────────────────
-    # 球面轨迹页面
-    # ────────────────────────────────────────────────────────────────
-    def _build_spherical_page(self):
-        scroll = QScrollArea(); scroll.setWidgetResizable(True)
-        w = QWidget(); scroll.setWidget(w)
-        layout = QVBoxLayout(w); layout.setSpacing(6); layout.setContentsMargins(6,6,6,6)
-
-        grp1 = QGroupBox("球面参数")
-        g1   = QVBoxLayout(grp1)
-        self.sph_R,   r1 = lineedit_input("球体半径 R (mm)：")
-        self.sph_zc,  r2 = lineedit_input("球心 Z 坐标 zc：",  "0")
-        self.sph_h,   r3 = lineedit_input("球冠高度 h (mm)：")
-        self.sph_cmb_surf = QComboBox()
-        self.sph_cmb_surf.addItems(["凸球 (Convex)", "凹球 (Concave)"])
-        for r in [r1,r2,r3]: g1.addLayout(r)
-        combox_input(g1, "表面类型：", self.sph_cmb_surf)
-        layout.addWidget(grp1)
-
-        grp2, self.sph_t, self.sph_dir, self.sph_st, self.sph_sp, self.sph_pt, self.sph_arc = \
-            self._build_traj_group("sph")
-        layout.addWidget(grp2)
-
-        grp3 = QGroupBox("输出设置")
-        g3   = QVBoxLayout(grp3)
-        self.sph_fname, rf = lineedit_input("文件名：", "spherical_traj")
-        g3.addLayout(rf); layout.addWidget(grp3)
-
-        btn_row = QHBoxLayout()
-        self.sph_btn_gen  = QPushButton("生成轨迹")
-        self.sph_btn_save = QPushButton("保存 TXT"); self.sph_btn_save.setEnabled(False)
-        btn_row.addWidget(self.sph_btn_gen); btn_row.addWidget(self.sph_btn_save)
-        layout.addLayout(btn_row)
-        layout.addWidget(divider())
-        self.sph_info = QLabel(""); self.sph_info.setWordWrap(True)
-        layout.addWidget(self.sph_info); layout.addStretch()
-
-        self.sph_btn_gen.clicked.connect(self._do_generate_spherical)
-        self.sph_btn_save.clicked.connect(
-            lambda: self._do_save("球面轨迹", self.sph_fname.text(), is_surface=True))
-        return scroll
-
-    def _do_generate_spherical(self):
-        def f(e, n):
-            try: return float(e.text())
-            except: raise ValueError(f"参数「{n}」输入无效")
-        try:
-            tp = self._read_traj(self.sph_t, self.sph_dir, self.sph_st,
-                                  self.sph_sp, self.sph_pt, self.sph_arc)
-            surf = "convex" if self.sph_cmb_surf.currentIndex() == 0 else "concave"
-            pts = generate_spherical(
-                R=f(self.sph_R,"球体半径R"), zc=f(self.sph_zc,"球心Z"),
-                surf_type=surf, h=f(self.sph_h,"球冠高度h"), **tp)
-        except ValueError as e:
-            QMessageBox.warning(self._main, "参数错误", str(e)); return
-        if not pts:
-            QMessageBox.warning(self._main, "警告", "未生成任何轨迹点"); return
-        meta = {"surface_name":"球面", "traj_name":("栅形" if tp["traj_type"]=="G" else "螺旋线")+"轨迹"}
-        self._finish(pts, meta, self.sph_btn_save, self.sph_info, "球面轨迹", is_surface=True)
-
-    # ────────────────────────────────────────────────────────────────
-    # 柱面轨迹页面
-    # ────────────────────────────────────────────────────────────────
-    def _build_cylindrical_page(self):
-        scroll = QScrollArea(); scroll.setWidgetResizable(True)
-        w = QWidget(); scroll.setWidget(w)
-        layout = QVBoxLayout(w); layout.setSpacing(6); layout.setContentsMargins(6,6,6,6)
-
-        grp1 = QGroupBox("柱面参数")
-        g1   = QVBoxLayout(grp1)
-        self.cyl_cmb_axis = QComboBox()
-        self.cyl_cmb_axis.addItems(["轴线沿 Y 方向", "轴线沿 X 方向"])
-        combox_input(g1, "轴线方向：", self.cyl_cmb_axis)
-        self.cyl_cmb_surf = QComboBox()
-        self.cyl_cmb_surf.addItems(["凸柱外表面 (Convex)", "凹柱内表面 (Concave)"])
-        combox_input(g1, "表面类型：", self.cyl_cmb_surf)
-        self.cyl_R,    r1 = lineedit_input("圆柱半径 R (mm)：")
-        self.cyl_zc,   r2 = lineedit_input("圆柱截面圆心 Z (zc)：", "0")
-        self.cyl_k,    r3 = lineedit_input("切割平面高度 k：",       "0")
-        self.cyl_amin, r4 = lineedit_input("轴向范围起点 (mm)：",    "-50")
-        self.cyl_amax, r5 = lineedit_input("轴向范围终点 (mm)：",    "50")
-        for r in [r1,r2,r3,r4,r5]: g1.addLayout(r)
-
-        self.cyl_cmb_proj = QComboBox()
-        self.cyl_cmb_proj.addItems(["矩形投影区域", "圆形投影区域"])
-        combox_input(g1, "投影区域：", self.cyl_cmb_proj)
-        self.cyl_pR, rp = lineedit_input("投影圆半径 (mm)：", "0")
-        g1.addLayout(rp)
-
-        def _cyl_proj_changed(idx):
-            self.cyl_pR.setVisible(idx == 1)
-        self.cyl_cmb_proj.currentIndexChanged.connect(_cyl_proj_changed)
-        _cyl_proj_changed(0)
-        layout.addWidget(grp1)
-
-        grp2, self.cyl_t, self.cyl_dir, self.cyl_st, self.cyl_sp, self.cyl_pt, self.cyl_arc = \
-            self._build_traj_group("cyl")
-        layout.addWidget(grp2)
-
-        grp3 = QGroupBox("输出设置")
-        g3   = QVBoxLayout(grp3)
-        self.cyl_fname, rf = lineedit_input("文件名：", "cylindrical_traj")
-        g3.addLayout(rf); layout.addWidget(grp3)
-
-        btn_row = QHBoxLayout()
-        self.cyl_btn_gen  = QPushButton("生成轨迹")
-        self.cyl_btn_save = QPushButton("保存 TXT"); self.cyl_btn_save.setEnabled(False)
-        btn_row.addWidget(self.cyl_btn_gen); btn_row.addWidget(self.cyl_btn_save)
-        layout.addLayout(btn_row)
-        layout.addWidget(divider())
-        self.cyl_info = QLabel(""); self.cyl_info.setWordWrap(True)
-        layout.addWidget(self.cyl_info); layout.addStretch()
-
-        self.cyl_btn_gen.clicked.connect(self._do_generate_cylindrical)
-        self.cyl_btn_save.clicked.connect(
-            lambda: self._do_save("柱面轨迹", self.cyl_fname.text(), is_surface=True))
-        return scroll
-
-    def _do_generate_cylindrical(self):
-        def f(e, n):
-            try: return float(e.text())
-            except: raise ValueError(f"参数「{n}」输入无效")
-        try:
-            tp = self._read_traj(self.cyl_t, self.cyl_dir, self.cyl_st,
-                                  self.cyl_sp, self.cyl_pt, self.cyl_arc)
-            axis_dir = "Y" if self.cyl_cmb_axis.currentIndex() == 0 else "X"
-            surf_t   = "C" if self.cyl_cmb_surf.currentIndex() == 0 else "V"
-            proj_s   = "R" if self.cyl_cmb_proj.currentIndex() == 0 else "C"
-            pts = generate_cylindrical(
-                R=f(self.cyl_R,"圆柱半径R"), zc=f(self.cyl_zc,"圆心Z"),
-                k_cut=f(self.cyl_k,"切割平面k"),
-                axis_dir=axis_dir, surf_type=surf_t,
-                axis_min=f(self.cyl_amin,"轴向起点"), axis_max=f(self.cyl_amax,"轴向终点"),
-                proj_shape=proj_s, proj_R=f(self.cyl_pR,"投影圆半径"), **tp)
-        except ValueError as e:
-            QMessageBox.warning(self._main, "参数错误", str(e)); return
-        if not pts:
-            QMessageBox.warning(self._main, "警告", "未生成任何轨迹点"); return
-        meta = {"surface_name":"柱面", "traj_name":("栅形" if tp["traj_type"]=="G" else "螺旋线")+"轨迹"}
-        self._finish(pts, meta, self.cyl_btn_save, self.cyl_info, "柱面轨迹", is_surface=True)
-
-    # ────────────────────────────────────────────────────────────────
-    # 锥面轨迹页面
-    # ────────────────────────────────────────────────────────────────
-    def _build_conical_page(self):
-        scroll = QScrollArea(); scroll.setWidgetResizable(True)
-        w = QWidget(); scroll.setWidget(w)
-        layout = QVBoxLayout(w); layout.setSpacing(6); layout.setContentsMargins(6,6,6,6)
-
-        grp1 = QGroupBox("锥面参数")
-        g1   = QVBoxLayout(grp1)
-        self.con_cmb_type = QComboBox()
-        self.con_cmb_type.addItems(["凸锥 (Convex)", "凹锥 (Concave)"])
-        combox_input(g1, "锥体类型：", self.con_cmb_type)
-        self.con_alpha, r1 = lineedit_input("半顶角 α (度)：",  "30")
-        self.con_H,     r2 = lineedit_input("高度 H (mm)：",    "50")
-        for r in [r1,r2]: g1.addLayout(r)
-        layout.addWidget(grp1)
-
-        grp2 = QGroupBox("覆盖范围")
-        g2   = QVBoxLayout(grp2)
-        self.con_cmb_cover = QComboBox()
-        self.con_cmb_cover.addItems(["全覆盖（底面圆）", "局部矩形", "局部圆形"])
-        combox_input(g2, "覆盖类型：", self.con_cmb_cover)
-        self.con_rx1, rc1 = lineedit_input("矩形 X_min (mm)：", "0")
-        self.con_rx2, rc2 = lineedit_input("矩形 X_max (mm)：", "0")
-        self.con_ry1, rc3 = lineedit_input("矩形 Y_min (mm)：", "0")
-        self.con_ry2, rc4 = lineedit_input("矩形 Y_max (mm)：", "0")
-        self.con_cR,  rc5 = lineedit_input("圆形半径 (mm)：",   "0")
-        self.con_cx,  rc6 = lineedit_input("圆心 X (mm)：",     "0")
-        self.con_cy,  rc7 = lineedit_input("圆心 Y (mm)：",     "0")
-        for r in [rc1,rc2,rc3,rc4,rc5,rc6,rc7]: g2.addLayout(r)
-
-        def _con_cover_changed(idx):
-            for ww in [self.con_rx1,self.con_rx2,self.con_ry1,self.con_ry2]:
-                ww.setVisible(idx==1)
-            for ww in [self.con_cR,self.con_cx,self.con_cy]:
-                ww.setVisible(idx==2)
-        self.con_cmb_cover.currentIndexChanged.connect(_con_cover_changed)
-        _con_cover_changed(0)
-        layout.addWidget(grp2)
-
-        grp3, self.con_t, self.con_dir, self.con_st, self.con_sp, self.con_pt, self.con_arc = \
-            self._build_traj_group("con")
-        layout.addWidget(grp3)
-
-        grp4 = QGroupBox("输出设置")
-        g4   = QVBoxLayout(grp4)
-        self.con_fname, rf = lineedit_input("文件名：", "conical_traj")
-        g4.addLayout(rf); layout.addWidget(grp4)
-
-        btn_row = QHBoxLayout()
-        self.con_btn_gen  = QPushButton("生成轨迹")
-        self.con_btn_save = QPushButton("保存 TXT"); self.con_btn_save.setEnabled(False)
-        btn_row.addWidget(self.con_btn_gen); btn_row.addWidget(self.con_btn_save)
-        layout.addLayout(btn_row)
-        layout.addWidget(divider())
-        self.con_info = QLabel(""); self.con_info.setWordWrap(True)
-        layout.addWidget(self.con_info); layout.addStretch()
-
-        self.con_btn_gen.clicked.connect(self._do_generate_conical)
-        self.con_btn_save.clicked.connect(
-            lambda: self._do_save("锥面轨迹", self.con_fname.text(), is_surface=True))
-        return scroll
-
-    def _do_generate_conical(self):
-        def f(e, n):
-            try: return float(e.text())
-            except: raise ValueError(f"参数「{n}」输入无效")
-        try:
-            tp = self._read_traj(self.con_t, self.con_dir, self.con_st,
-                                  self.con_sp, self.con_pt, self.con_arc)
-            cone_t  = 1 if self.con_cmb_type.currentIndex() == 0 else 2
-            cover_t = self.con_cmb_cover.currentIndex() + 1
-            pts = generate_conical(
-                cone_type=cone_t,
-                alpha_deg=f(self.con_alpha,"半顶角α"), H=f(self.con_H,"高度H"),
-                cover_type=cover_t,
-                rect_xmin=f(self.con_rx1,"X_min"), rect_xmax=f(self.con_rx2,"X_max"),
-                rect_ymin=f(self.con_ry1,"Y_min"), rect_ymax=f(self.con_ry2,"Y_max"),
-                circ_R=f(self.con_cR,"圆形半径"),
-                circ_xc=f(self.con_cx,"圆心X"), circ_yc=f(self.con_cy,"圆心Y"),
-                **tp)
-        except ValueError as e:
-            QMessageBox.warning(self._main, "参数错误", str(e)); return
-        if not pts:
-            QMessageBox.warning(self._main, "警告", "未生成任何轨迹点"); return
-        meta = {"surface_name":"锥面", "traj_name":("栅形" if tp["traj_type"]=="G" else "螺旋线")+"轨迹"}
-        self._finish(pts, meta, self.con_btn_save, self.con_info, "锥面轨迹", is_surface=True)
-
-
-    # ════════════════════════════════════════════════════════════════════
-    # 曲面轨迹 —— 统一选择器页面（顶部下拉框 + 子页 QStackedWidget）
-    # ════════════════════════════════════════════════════════════════════
-    # ────────────────────────────────────────────────────────────────
-    # 平面轨迹页面（栅形 + 螺旋线，Z=0，法向量(0,0,1)）
-    # ────────────────────────────────────────────────────────────────
-    def _build_planar_page(self):
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        w = QWidget()
-        scroll.setWidget(w)
-        layout = QVBoxLayout(w)
-        layout.setSpacing(6)
-        layout.setContentsMargins(6, 6, 6, 6)
-
-        # ① 形状参数
-        grp1 = QGroupBox("形状参数")
-        g1 = QVBoxLayout(grp1)
-        self.pl_cmb_shape = QComboBox()
-        self.pl_cmb_shape.addItems(["矩形 (Rectangle)", "圆形 (Circle)"])
-        combox_input(g1, "形状类型：", self.pl_cmb_shape)
-        self.pl_edt_A, rowA = lineedit_input("矩形长 A (mm)：", "100")
-        self.pl_edt_B, rowB = lineedit_input("矩形宽 B (mm)：", "100")
-        self.pl_edt_R, rowR = lineedit_input("圆形半径 R (mm)：", "50")
-        g1.addLayout(rowA); g1.addLayout(rowB); g1.addLayout(rowR)
-        layout.addWidget(grp1)
-
-        # ② 轨迹类型
-        grp2 = QGroupBox("轨迹类型")
-        g2 = QVBoxLayout(grp2)
-        self.pl_cmb_traj = QComboBox()
-        self.pl_cmb_traj.addItems(["栅形轨迹 (Raster)", "螺旋线轨迹 (Spiral)"])
-        combox_input(g2, "轨迹类型：", self.pl_cmb_traj)
-        layout.addWidget(grp2)
-
-        # ③ 栅形参数
-        self.pl_grp_raster = QGroupBox("栅形参数")
-        g3 = QVBoxLayout(self.pl_grp_raster)
-        self.pl_cmb_dir = QComboBox()
-        self.pl_cmb_dir.addItems(["平行于 X 轴（沿 Y 方向推进）",
-                                   "平行于 Y 轴（沿 X 方向推进）"])
-        combox_input(g3, "扫描方向：", self.pl_cmb_dir)
-        self.pl_edt_step,    row_st  = lineedit_input("点间步长 (mm)：", "1.0")
-        self.pl_edt_spacing, row_sp  = lineedit_input("线间距 (mm)：",   "5.0")
-        g3.addLayout(row_st); g3.addLayout(row_sp)
-        self.pl_cmb_cover = QComboBox()
-        self.pl_cmb_cover.addItems(["全部覆盖", "局部子区域"])
-        combox_input(g3, "覆盖范围：", self.pl_cmb_cover)
-        # 子区域参数（全部覆盖时隐藏）
-        self.pl_lbl_sub = QLabel("── 子区域参数 ──")
-        g3.addWidget(self.pl_lbl_sub)
-        self.pl_edt_sx0, row_sx0 = lineedit_input("左下角 X₀ (mm)：", "0")
-        self.pl_edt_sy0, row_sy0 = lineedit_input("左下角 Y₀ (mm)：", "0")
-        self.pl_edt_sC,  row_sC  = lineedit_input("区域长 C (mm)：",  "10")
-        self.pl_edt_sD,  row_sD  = lineedit_input("区域宽 D (mm)：",  "10")
-        self.pl_wrap_rsub = QWidget()
-        wrs = QVBoxLayout(self.pl_wrap_rsub)
-        wrs.setContentsMargins(0, 0, 0, 0); wrs.setSpacing(2)
-        for row in [row_sx0, row_sy0, row_sC, row_sD]:
-            wrs.addLayout(row)
-        g3.addWidget(self.pl_wrap_rsub)
-        layout.addWidget(self.pl_grp_raster)
-
-        # ④ 螺旋线参数
-        self.pl_grp_spiral = QGroupBox("螺旋线参数")
-        g4 = QVBoxLayout(self.pl_grp_spiral)
-        self.pl_edt_pitch,   row_pit = lineedit_input("螺距（每圈半径增量，mm）：", "5.0")
-        self.pl_edt_arcstep, row_as  = lineedit_input("弧长步长（点间距，mm）：",   "1.0")
-        g4.addLayout(row_pit); g4.addLayout(row_as)
-        self.pl_cmb_spiral_cover = QComboBox()
-        self.pl_cmb_spiral_cover.addItems(["圆形覆盖范围", "矩形覆盖范围"])
-        combox_input(g4, "覆盖范围：", self.pl_cmb_spiral_cover)
-        # 圆形参数
-        self.pl_edt_Rmax, row_rm = lineedit_input("最大半径 R_max (mm)：", "50")
-        g4.addLayout(row_rm)
-        # 矩形参数
-        self.pl_lbl_srect = QLabel("── 矩形范围参数 ──")
-        g4.addWidget(self.pl_lbl_srect)
-        self.pl_edt_sxmin, row_sxn = lineedit_input("X_min (mm)：",  "0")
-        self.pl_edt_symin, row_syn = lineedit_input("Y_min (mm)：",  "0")
-        self.pl_edt_sxmax, row_sxx = lineedit_input("X_max (mm)：", "100")
-        self.pl_edt_symax, row_syx = lineedit_input("Y_max (mm)：", "100")
-        self.pl_wrap_ssub = QWidget()
-        wss = QVBoxLayout(self.pl_wrap_ssub)
-        wss.setContentsMargins(0, 0, 0, 0); wss.setSpacing(2)
-        for row in [row_sxn, row_syn, row_sxx, row_syx]:
-            wss.addLayout(row)
-        g4.addWidget(self.pl_wrap_ssub)
-        layout.addWidget(self.pl_grp_spiral)
-
-        # ⑤ 输出
-        grp5 = QGroupBox("输出设置")
-        g5 = QVBoxLayout(grp5)
-        self.pl_edt_fname, row_fn = lineedit_input("文件名：", "planar_traj")
-        g5.addLayout(row_fn)
-        layout.addWidget(grp5)
-
-        btn_row = QHBoxLayout()
-        self.pl_btn_gen  = QPushButton("生成轨迹")
-        self.pl_btn_save = QPushButton("保存 TXT")
-        self.pl_btn_save.setEnabled(False)
-        btn_row.addWidget(self.pl_btn_gen)
-        btn_row.addWidget(self.pl_btn_save)
-        layout.addLayout(btn_row)
-        layout.addWidget(divider())
-        self.pl_info_lbl = QLabel("")
-        self.pl_info_lbl.setWordWrap(True)
-        layout.addWidget(self.pl_info_lbl)
-        layout.addStretch()
-
-        # 信号
-        self.pl_cmb_shape.currentIndexChanged.connect(self._pl_shape_changed)
-        self.pl_cmb_traj.currentIndexChanged.connect(self._pl_traj_changed)
-        self.pl_cmb_cover.currentIndexChanged.connect(self._pl_cover_changed)
-        self.pl_cmb_spiral_cover.currentIndexChanged.connect(self._pl_spiral_cover_changed)
-        self.pl_btn_gen.clicked.connect(self._do_generate_planar)
-        self.pl_btn_save.clicked.connect(
-            lambda: self._do_save("平面轨迹", self.pl_edt_fname.text()))
-        self._pl_shape_changed()
-        self._pl_traj_changed()
-        self._pl_cover_changed()
-        self._pl_spiral_cover_changed()
-        return scroll
-
-    def _pl_shape_changed(self):
-        is_r = self.pl_cmb_shape.currentIndex() == 0
-        for w in [self.pl_edt_A, self.pl_edt_B]: w.setVisible(is_r)
-        self.pl_edt_R.setVisible(not is_r)
-
-    def _pl_traj_changed(self):
-        is_raster = (self.pl_cmb_traj.currentIndex() == 0)
-        self.pl_grp_raster.setVisible(is_raster)
-        self.pl_grp_spiral.setVisible(not is_raster)
-        if is_raster:
-            self._pl_cover_changed()
-        else:
-            self._pl_spiral_cover_changed()
-
-    def _pl_cover_changed(self):
-        sub = (self.pl_cmb_cover.currentIndex() == 1)
-        self.pl_lbl_sub.setVisible(sub)
-        self.pl_wrap_rsub.setVisible(sub)
-
-    def _pl_spiral_cover_changed(self):
-        is_circ = (self.pl_cmb_spiral_cover.currentIndex() == 0)
-        self.pl_edt_Rmax.setVisible(is_circ)
-        self.pl_lbl_srect.setVisible(not is_circ)
-        self.pl_wrap_ssub.setVisible(not is_circ)
-
-    def _do_generate_planar(self):
-        def f(e, n):
-            try: return float(e.text())
-            except: raise ValueError(f"参数「{n}」输入无效")
-        try:
-            shape = "R" if self.pl_cmb_shape.currentIndex() == 0 else "C"
-            traj  = "G" if self.pl_cmb_traj.currentIndex() == 0 else "S"
-            p = {"shape": shape}
-            if shape == "R":
-                p["rect_A"] = f(self.pl_edt_A, "矩形长A")
-                p["rect_B"] = f(self.pl_edt_B, "矩形宽B")
-            else:
-                p["circle_R"] = f(self.pl_edt_R, "圆形半径R")
-
-            if traj == "G":
-                p["direction"]    = "X" if self.pl_cmb_dir.currentIndex() == 0 else "Y"
-                p["step_len"]     = f(self.pl_edt_step,    "步长")
-                p["line_spacing"] = f(self.pl_edt_spacing, "线间距")
-                p["cover_type"]   = self.pl_cmb_cover.currentIndex() + 1
-                if p["cover_type"] == 2:
-                    p["sub_x0"] = f(self.pl_edt_sx0, "左下角X₀")
-                    p["sub_y0"] = f(self.pl_edt_sy0, "左下角Y₀")
-                    p["sub_C"]  = f(self.pl_edt_sC,  "区域长C")
-                    p["sub_D"]  = f(self.pl_edt_sD,  "区域宽D")
-                pts = generate_planar_raster(**p)
-                tname = "栅形轨迹"
-            else:
-                p["pitch"]    = f(self.pl_edt_pitch,   "螺距")
-                p["arc_step"] = f(self.pl_edt_arcstep, "弧长步长")
-                p["spiral_cover_type"] = self.pl_cmb_spiral_cover.currentIndex() + 1
-                if p["spiral_cover_type"] == 1:
-                    p["spiral_R_max"] = f(self.pl_edt_Rmax, "最大半径R_max")
-                else:
-                    p["spiral_xmin"] = f(self.pl_edt_sxmin, "X_min")
-                    p["spiral_ymin"] = f(self.pl_edt_symin, "Y_min")
-                    p["spiral_xmax"] = f(self.pl_edt_sxmax, "X_max")
-                    p["spiral_ymax"] = f(self.pl_edt_symax, "Y_max")
-                pts = generate_planar_spiral(**p)
-                tname = "螺旋线轨迹"
-        except ValueError as e:
-            QMessageBox.warning(self._main, "参数错误", str(e)); return
-
-        if not pts:
-            QMessageBox.warning(self._main, "警告", "未生成任何轨迹点，请检查参数"); return
-
-        sname = "矩形" if shape == "R" else "圆形"
-        params = {"shape": shape, "traj_type": traj,
-                  "rect_A": p.get("rect_A", 0), "rect_B": p.get("rect_B", 0),
-                  "circle_R": p.get("circle_R", 0)}
-        self._finish(pts, params, self.pl_btn_save, self.pl_info_lbl,
-                     f"{sname}{tname}")
-
-    def _build_surface_selector_page(self):
-        outer = QWidget()
-        outer_layout = QVBoxLayout(outer)
-        outer_layout.setSpacing(6)
-        outer_layout.setContentsMargins(6, 6, 6, 6)
-
-        selector_grp = QGroupBox("轨迹类型选择")
-        sel_layout   = QVBoxLayout(selector_grp)
-        self.surf_cmb = QComboBox()
-        self.surf_cmb.addItems([
-            "—— 请选择轨迹类型 ——",
-            "平面轨迹 (Planar)",
-            "非球面 (Aspherical)",
-            "球面 (Spherical)",
-            "柱面 (Cylindrical)",
-            "锥面 (Conical)",
-        ])
-        self.surf_cmb.setFixedHeight(30)
-        sel_layout.addWidget(self.surf_cmb)
-        outer_layout.addWidget(selector_grp)
-
-        self.surf_stack = QStackedWidget()
-
-        hint = QWidget()
-        h_lay = QVBoxLayout(hint)
-        h_lay.addStretch()
-        lbl = QLabel("↑  请从上方下拉框选择轨迹类型")
-        lbl.setAlignment(Qt.AlignCenter)
-        lbl.setStyleSheet("color:#888888; font-size:12px;")
-        h_lay.addWidget(lbl)
-        h_lay.addStretch()
-        self.surf_stack.addWidget(hint)                           # idx 0
-
-        self.surf_stack.addWidget(self._build_planar_page())      # idx 1
-        self.surf_stack.addWidget(self._build_aspherical_page())  # idx 2
-        self.surf_stack.addWidget(self._build_spherical_page())   # idx 3
-        self.surf_stack.addWidget(self._build_cylindrical_page()) # idx 4
-        self.surf_stack.addWidget(self._build_conical_page())     # idx 5
-
-        outer_layout.addWidget(self.surf_stack, 1)
-
-        view_grp = QGroupBox("3D显示模式")
-        view_layout = QVBoxLayout(view_grp)
-        self.surface_view_cmb = QComboBox()
-        self.surface_view_cmb.addItems([
-            "左侧显示曲面，右侧显示轨迹",
-            "轨迹覆盖在曲面上",
-        ])
-        self.surface_view_cmb.setFixedHeight(30)
-        view_layout.addWidget(self.surface_view_cmb)
-        outer_layout.addWidget(view_grp)
-
-        self.surf_cmb.currentIndexChanged.connect(
-            lambda idx: self.surf_stack.setCurrentIndex(idx))
-        self.surface_view_cmb.currentIndexChanged.connect(self._surface_view_mode_changed)
-
-        return outer
-
-    def _surface_view_mode_changed(self, idx):
-        mode = "overlay" if idx == 1 else "split"
-        if self._main is not None and getattr(self._main, "preview", None) is not None:
-            self._main.preview.set_surface_view_mode(mode)
-            if getattr(self, "_last_is_surface", False) and self._points:
-                self._main.preview.plot_surface(self._points, self._params)
-
-    def _build_surface_control_group(self):
-        grp = QGroupBox("曲面轨迹总控制")
-        layout = QVBoxLayout(grp)
-        edt_spacing, row_sp = lineedit_input("间距 (mm)：", "2")
-        edt_step, row_st = lineedit_input("步长 (mm)：", "1")
-        layout.addLayout(row_sp)
-        layout.addLayout(row_st)
-        self._surface_control_pairs.append((edt_step, edt_spacing))
-        edt_step.textChanged.connect(
-            lambda txt, s=edt_step: self._sync_surface_control_value("step", txt, s))
-        edt_spacing.textChanged.connect(
-            lambda txt, s=edt_spacing: self._sync_surface_control_value("spacing", txt, s))
-        return grp, edt_step, edt_spacing
-
-    def _sync_surface_control_value(self, field, text, source):
-        idx = 0 if field == "step" else 1
-        for pair in self._surface_control_pairs:
-            edit = pair[idx]
-            if edit is source or edit.text() == text:
-                continue
-            blocker = QtCore.QSignalBlocker(edit)
-            edit.setText(text)
-            del blocker
-
-    def _read_surface_step_spacing(self, edt_step, edt_spacing):
-        def f(e, n):
-            try: return float(e.text())
-            except: raise ValueError(f"参数「{n}」输入无效")
-        step_len = f(edt_step, "步长")
-        line_spacing = f(edt_spacing, "间距")
-        return step_len, line_spacing, line_spacing, step_len
-
-    # ────────────────────────────────────────────────────────────────
-    # 非球面页面
-    # ────────────────────────────────────────────────────────────────
-    def _build_aspherical_page(self):
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        w = QWidget()
-        scroll.setWidget(w)
-        layout = QVBoxLayout(w)
-        layout.setSpacing(6)
-        layout.setContentsMargins(6, 6, 6, 6)
-
-        grp1 = QGroupBox("非球面基本参数")
-        g1 = QVBoxLayout(grp1)
-        self.asp_edt_R,   row_R   = lineedit_input("曲率半径 R (mm，正凸负凹)：", "100")
-        self.asp_edt_k,   row_k   = lineedit_input("圆锥常数 k：", "0")
-        self.asp_edt_off, row_off = lineedit_input("离轴量 offcenter (mm)：", "0")
-        for row in [row_R, row_k, row_off]:
-            g1.addLayout(row)
-        layout.addWidget(grp1)
-
-        grp2 = QGroupBox("多项式系数（不使用填 0）")
-        g2 = QVBoxLayout(grp2)
-        self.asp_edt_A4,  row_A4  = lineedit_input("A4：",  "0")
-        self.asp_edt_A6,  row_A6  = lineedit_input("A6：",  "0")
-        self.asp_edt_A8,  row_A8  = lineedit_input("A8：",  "0")
-        self.asp_edt_A10, row_A10 = lineedit_input("A10：", "0")
-        self.asp_edt_A12, row_A12 = lineedit_input("A12：", "0")
-        self.asp_edt_A14, row_A14 = lineedit_input("A14：", "0")
-        for row in [row_A4, row_A6, row_A8, row_A10, row_A12, row_A14]:
-            g2.addLayout(row)
-        layout.addWidget(grp2)
-
-        grp3 = QGroupBox("非球面口径")
-        g3 = QVBoxLayout(grp3)
-        self.asp_edt_W, row_W = lineedit_input("X方向总宽度 (mm)：", "100")
-        self.asp_edt_L, row_L = lineedit_input("Y方向总长度 (mm)：", "100")
-        g3.addLayout(row_W); g3.addLayout(row_L)
-        layout.addWidget(grp3)
-
-        grp4 = QGroupBox("轨迹边界")
-        g4 = QVBoxLayout(grp4)
-        self.asp_cmb_bound = QComboBox()
-        self.asp_cmb_bound.addItems([
-            "全口径矩形边界",
-            "局部矩形边界",
-            "局部圆形边界",
-        ])
-        combox_input(g4, "边界类型：", self.asp_cmb_bound)
-
-        self.asp_lbl_rect = QLabel("── 矩形边界参数 ──")
-        g4.addWidget(self.asp_lbl_rect)
-        self.asp_edt_xmin, row_xn = lineedit_input("X_min (mm)：", "-50")
-        self.asp_edt_xmax, row_xx = lineedit_input("X_max (mm)：",  "50")
-        self.asp_edt_ymin, row_yn = lineedit_input("Y_min (mm)：", "-50")
-        self.asp_edt_ymax, row_yx = lineedit_input("Y_max (mm)：",  "50")
-        self.asp_wrap_rect = QWidget()
-        wr = QVBoxLayout(self.asp_wrap_rect)
-        wr.setContentsMargins(0, 0, 0, 0); wr.setSpacing(2)
-        for row in [row_xn, row_xx, row_yn, row_yx]:
-            wr.addLayout(row)
-        g4.addWidget(self.asp_wrap_rect)
-
-        self.asp_lbl_circ = QLabel("── 圆形边界参数 ──")
-        g4.addWidget(self.asp_lbl_circ)
-        self.asp_edt_cR,  row_cR  = lineedit_input("圆形半径 (mm)：", "50")
-        self.asp_edt_cxc, row_cxc = lineedit_input("圆心 X (mm)：",   "0")
-        self.asp_edt_cyc, row_cyc = lineedit_input("圆心 Y (mm)：",   "0")
-        self.asp_wrap_circ = QWidget()
-        wc = QVBoxLayout(self.asp_wrap_circ)
-        wc.setContentsMargins(0, 0, 0, 0); wc.setSpacing(2)
-        for row in [row_cR, row_cxc, row_cyc]:
-            wc.addLayout(row)
-        g4.addWidget(self.asp_wrap_circ)
-        layout.addWidget(grp4)
-
-        grp5 = QGroupBox("轨迹参数")
-        g5 = QVBoxLayout(grp5)
-        self.asp_cmb_traj = QComboBox()
-        self.asp_cmb_traj.addItems(["栅形轨迹 (Raster)", "螺旋线轨迹 (Spiral)"])
-        combox_input(g5, "轨迹类型：", self.asp_cmb_traj)
-        self.asp_cmb_dir = QComboBox()
-        self.asp_cmb_dir.addItems(["X方向 (平行X轴)", "Y方向 (平行Y轴)"])
-        combox_input(g5, "栅形方向：", self.asp_cmb_dir)
-        self.asp_edt_spacing = QLineEdit("2")
-        self.asp_edt_step = QLineEdit("1")
-        self.asp_edt_pitch = QLineEdit("2")
-        self.asp_edt_arcstep = QLineEdit("1")
-        for hidden in [self.asp_edt_spacing, self.asp_edt_step,
-                       self.asp_edt_pitch, self.asp_edt_arcstep]:
-            hidden.setParent(self)
-            hidden.setVisible(False)
-        layout.addWidget(grp5)
-
-        grp6 = QGroupBox("输出设置")
-        g6 = QVBoxLayout(grp6)
-        self.asp_edt_fname, row_fn = lineedit_input("文件名：", "aspherical_traj")
-        g6.addLayout(row_fn)
-        layout.addWidget(grp6)
-
-        ctrl_grp, self.asp_ctrl_step, self.asp_ctrl_spacing = self._build_surface_control_group()
-        layout.addWidget(ctrl_grp)
-
-        btn_row = QHBoxLayout()
-        self.asp_btn_gen  = QPushButton("生成轨迹")
-        self.asp_btn_save = QPushButton("保存 TXT")
-        self.asp_btn_save.setEnabled(False)
-        btn_row.addWidget(self.asp_btn_gen)
-        btn_row.addWidget(self.asp_btn_save)
-        layout.addLayout(btn_row)
-        layout.addWidget(divider())
-        self.asp_info_lbl = QLabel("")
-        self.asp_info_lbl.setWordWrap(True)
-        layout.addWidget(self.asp_info_lbl)
-        layout.addStretch()
-
-        self.asp_cmb_bound.currentIndexChanged.connect(self._asp_bound_changed)
-        self.asp_cmb_traj.currentIndexChanged.connect(self._asp_traj_changed)
-        self.asp_btn_gen.clicked.connect(self._do_generate_aspherical)
-        self.asp_btn_save.clicked.connect(
-            lambda: self._do_save("非球面轨迹", self.asp_edt_fname.text(), is_surface=True))
-        self._asp_bound_changed()
-        self._asp_traj_changed()
-        return scroll
-
-    def _asp_bound_changed(self):
-        idx = self.asp_cmb_bound.currentIndex()
-        show_rect = (idx == 1)
-        show_circ = (idx == 2)
-        self.asp_lbl_rect.setVisible(show_rect)
-        self.asp_wrap_rect.setVisible(show_rect)
-        self.asp_lbl_circ.setVisible(show_circ)
-        self.asp_wrap_circ.setVisible(show_circ)
-
-    def _asp_traj_changed(self):
-        is_raster = (self.asp_cmb_traj.currentIndex() == 0)
-        self.asp_cmb_dir.setVisible(is_raster)
-        # 间距/步长始终显示，不随轨迹类型切换
-        self.asp_edt_spacing.setVisible(False)
-        self.asp_edt_step.setVisible(False)
-        self.asp_edt_pitch.setVisible(False)
-        self.asp_edt_arcstep.setVisible(False)
-
-    def _do_generate_aspherical(self):
-        def f(e, n):
-            try: return float(e.text())
-            except: raise ValueError(f"参数「{n}」输入无效")
-        try:
-            R   = f(self.asp_edt_R,   "曲率半径R")
-            k   = f(self.asp_edt_k,   "圆锥常数k")
-            off = f(self.asp_edt_off, "离轴量")
-            A4  = f(self.asp_edt_A4,  "A4")
-            A6  = f(self.asp_edt_A6,  "A6")
-            A8  = f(self.asp_edt_A8,  "A8")
-            A10 = f(self.asp_edt_A10, "A10")
-            A12 = f(self.asp_edt_A12, "A12")
-            A14 = f(self.asp_edt_A14, "A14")
-            W   = f(self.asp_edt_W,   "X方向宽度")
-            L   = f(self.asp_edt_L,   "Y方向长度")
-            bound = self.asp_cmb_bound.currentIndex() + 1
-            traj  = "G" if self.asp_cmb_traj.currentIndex() == 0 else "S"
-            dire  = "X" if self.asp_cmb_dir.currentIndex()  == 0 else "Y"
-            step_len, line_spacing, pitch, arc_step = self._read_surface_step_spacing(
-                self.asp_ctrl_step, self.asp_ctrl_spacing)
-            kwargs = dict(R=R, k=k, A4=A4, A6=A6, A8=A8, A10=A10, A12=A12, A14=A14,
-                          offcenter=off, traj_type=traj, direction=dire,
-                          step_len=step_len, line_spacing=line_spacing,
-                          pitch=pitch, arc_step=arc_step,
-                          bound_type=bound, full_width=W, full_length=L)
-            if bound == 2:
-                kwargs.update(rect_xmin=f(self.asp_edt_xmin,"X_min"),
-                              rect_xmax=f(self.asp_edt_xmax,"X_max"),
-                              rect_ymin=f(self.asp_edt_ymin,"Y_min"),
-                              rect_ymax=f(self.asp_edt_ymax,"Y_max"))
-            elif bound == 3:
-                kwargs.update(circ_R=f(self.asp_edt_cR,"圆形半径"),
-                              circ_xc=f(self.asp_edt_cxc,"圆心X"),
-                              circ_yc=f(self.asp_edt_cyc,"圆心Y"))
-        except ValueError as e:
-            QMessageBox.warning(self._main, "参数错误", str(e)); return
-        try:
-            pts = generate_aspherical(**kwargs)
-        except ValueError as e:
-            QMessageBox.warning(self._main, "生成失败", str(e)); return
-        if not pts:
-            QMessageBox.warning(self._main, "警告", "未生成任何轨迹点"); return
-        tname = "栅形" if traj == "G" else "螺旋线"
-        # 把非球面几何参数收进 geom（左图按此渲染实体曲面）
-        geom = {"type": "aspherical",
-                "R": R, "k": k, "A4": A4, "A6": A6, "A8": A8,
-                "A10": A10, "A12": A12, "A14": A14,
-                "offcenter": off, "bound_type": bound,
-                "full_width": W, "full_length": L}
-        if bound == 2:
-            geom.update(rect_xmin=kwargs["rect_xmin"], rect_xmax=kwargs["rect_xmax"],
-                        rect_ymin=kwargs["rect_ymin"], rect_ymax=kwargs["rect_ymax"])
-        elif bound == 3:
-            geom.update(circ_R=kwargs["circ_R"], circ_xc=kwargs["circ_xc"],
-                        circ_yc=kwargs["circ_yc"])
-        params = {"surface_name": "非球面", "traj_name": tname + "轨迹", "geom": geom}
-        self._finish(pts, params, self.asp_btn_save, self.asp_info_lbl,
-                     f"非球面{tname}轨迹", is_surface=True)
-
-    # ────────────────────────────────────────────────────────────────
-    # 球面页面
-    # ────────────────────────────────────────────────────────────────
-    def _build_spherical_page(self):
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        w = QWidget()
-        scroll.setWidget(w)
-        layout = QVBoxLayout(w)
-        layout.setSpacing(6)
-        layout.setContentsMargins(6, 6, 6, 6)
-
-        grp1 = QGroupBox("球面参数")
-        g1 = QVBoxLayout(grp1)
-        self.sph_edt_R,  row_R  = lineedit_input("球体半径 R (正数, mm)：", "100")
-        self.sph_edt_zc, row_zc = lineedit_input("球心 Z 坐标 zc：", "0")
-        self.sph_edt_h,  row_h  = lineedit_input("球冠高度 h (mm，0 < h ≤ 2R)：", "100")
-        g1.addLayout(row_R); g1.addLayout(row_zc); g1.addLayout(row_h)
-        self.sph_cmb_type = QComboBox()
-        self.sph_cmb_type.addItems(["凸球面 (Convex)", "凹球面 (Concave)"])
-        combox_input(g1, "表面类型：", self.sph_cmb_type)
-        layout.addWidget(grp1)
-
-        # —— 覆盖范围 ——
-        grp_cv = QGroupBox("覆盖范围")
-        gcv = QVBoxLayout(grp_cv)
-        self.sph_cmb_cover = QComboBox()
-        self.sph_cmb_cover.addItems([
-            "全部覆盖（整个球冠投影圆）",
-            "局部矩形区域",
-            "局部圆形区域",
-        ])
-        combox_input(gcv, "覆盖类型：", self.sph_cmb_cover)
-
-        self.sph_lbl_rect = QLabel("── 矩形区域参数 ──")
-        gcv.addWidget(self.sph_lbl_rect)
-        self.sph_edt_rxmin, row_rxn = lineedit_input("X_min (mm)：", "-50")
-        self.sph_edt_rxmax, row_rxx = lineedit_input("X_max (mm)：",  "50")
-        self.sph_edt_rymin, row_ryn = lineedit_input("Y_min (mm)：", "-50")
-        self.sph_edt_rymax, row_ryx = lineedit_input("Y_max (mm)：",  "50")
-        self.sph_wrap_rect = QWidget()
-        wr = QVBoxLayout(self.sph_wrap_rect)
-        wr.setContentsMargins(0, 0, 0, 0); wr.setSpacing(2)
-        for row in [row_rxn, row_rxx, row_ryn, row_ryx]:
-            wr.addLayout(row)
-        gcv.addWidget(self.sph_wrap_rect)
-
-        self.sph_lbl_circ = QLabel("── 圆形区域参数 ──")
-        gcv.addWidget(self.sph_lbl_circ)
-        self.sph_edt_cR,  row_cR  = lineedit_input("圆形半径 (mm)：", "50")
-        self.sph_edt_cxc, row_cxc = lineedit_input("圆心 X (mm)：",   "0")
-        self.sph_edt_cyc, row_cyc = lineedit_input("圆心 Y (mm)：",   "0")
-        self.sph_wrap_circ = QWidget()
-        wc = QVBoxLayout(self.sph_wrap_circ)
-        wc.setContentsMargins(0, 0, 0, 0); wc.setSpacing(2)
-        for row in [row_cR, row_cxc, row_cyc]:
-            wc.addLayout(row)
-        gcv.addWidget(self.sph_wrap_circ)
-        layout.addWidget(grp_cv)
-
-        grp2 = QGroupBox("轨迹参数")
-        g2 = QVBoxLayout(grp2)
-        self.sph_cmb_traj = QComboBox()
-        self.sph_cmb_traj.addItems(["栅形轨迹 (Raster)", "螺旋线轨迹 (Spiral)"])
-        combox_input(g2, "轨迹类型：", self.sph_cmb_traj)
-        self.sph_cmb_dir = QComboBox()
-        self.sph_cmb_dir.addItems(["X方向 (平行X轴)", "Y方向 (平行Y轴)"])
-        combox_input(g2, "栅形方向：", self.sph_cmb_dir)
-        self.sph_edt_spacing = QLineEdit("2")
-        self.sph_edt_step = QLineEdit("1")
-        self.sph_edt_pitch = QLineEdit("2")
-        self.sph_edt_arcstep = QLineEdit("1")
-        for hidden in [self.sph_edt_spacing, self.sph_edt_step,
-                       self.sph_edt_pitch, self.sph_edt_arcstep]:
-            hidden.setParent(self)
-            hidden.setVisible(False)
-        layout.addWidget(grp2)
-
-        grp3 = QGroupBox("输出设置")
-        g3 = QVBoxLayout(grp3)
-        self.sph_edt_fname, row_fn = lineedit_input("文件名：", "spherical_traj")
-        g3.addLayout(row_fn)
-        layout.addWidget(grp3)
-
-        ctrl_grp, self.sph_ctrl_step, self.sph_ctrl_spacing = self._build_surface_control_group()
-        layout.addWidget(ctrl_grp)
-
-        btn_row = QHBoxLayout()
-        self.sph_btn_gen  = QPushButton("生成轨迹")
-        self.sph_btn_save = QPushButton("保存 TXT")
-        self.sph_btn_save.setEnabled(False)
-        btn_row.addWidget(self.sph_btn_gen)
-        btn_row.addWidget(self.sph_btn_save)
-        layout.addLayout(btn_row)
-        layout.addWidget(divider())
-        self.sph_info_lbl = QLabel("")
-        self.sph_info_lbl.setWordWrap(True)
-        layout.addWidget(self.sph_info_lbl)
-        layout.addStretch()
-
-        self.sph_cmb_traj.currentIndexChanged.connect(self._sph_traj_changed)
-        self.sph_cmb_cover.currentIndexChanged.connect(self._sph_cover_changed)
-        self.sph_btn_gen.clicked.connect(self._do_generate_spherical)
-        self.sph_btn_save.clicked.connect(
-            lambda: self._do_save("球面轨迹", self.sph_edt_fname.text(), is_surface=True))
-        self._sph_traj_changed()
-        self._sph_cover_changed()
-        return scroll
-
-    def _sph_traj_changed(self):
-        is_raster = (self.sph_cmb_traj.currentIndex() == 0)
-        self.sph_cmb_dir.setVisible(is_raster)
-        self.sph_edt_spacing.setVisible(False)
-        self.sph_edt_step.setVisible(False)
-        self.sph_edt_pitch.setVisible(False)
-        self.sph_edt_arcstep.setVisible(False)
-
-    def _sph_cover_changed(self):
-        idx = self.sph_cmb_cover.currentIndex()
-        show_rect = (idx == 1)
-        show_circ = (idx == 2)
-        self.sph_lbl_rect.setVisible(show_rect)
-        self.sph_wrap_rect.setVisible(show_rect)
-        self.sph_lbl_circ.setVisible(show_circ)
-        self.sph_wrap_circ.setVisible(show_circ)
-
-    def _do_generate_spherical(self):
-        def f(e, n):
-            try: return float(e.text())
-            except: raise ValueError(f"参数「{n}」输入无效")
-        try:
-            R    = f(self.sph_edt_R,  "球体半径R")
-            zc   = f(self.sph_edt_zc, "球心Z坐标")
-            h    = f(self.sph_edt_h,  "球冠高度h")
-            surf = "convex" if self.sph_cmb_type.currentIndex() == 0 else "concave"
-            traj = "G" if self.sph_cmb_traj.currentIndex() == 0 else "S"
-            dire = "X" if self.sph_cmb_dir.currentIndex()  == 0 else "Y"
-            cover = self.sph_cmb_cover.currentIndex() + 1  # 1/2/3
-            step_len, line_spacing, pitch, arc_step = self._read_surface_step_spacing(
-                self.sph_ctrl_step, self.sph_ctrl_spacing)
-            kwargs = dict(R=R, zc=zc, surf_type=surf, h=h,
-                          traj_type=traj, direction=dire,
-                          step_len=step_len, line_spacing=line_spacing,
-                          pitch=pitch, arc_step=arc_step,
-                          cover_type=cover,
-                          wall_thickness=SPHERICAL_WALL_THICKNESS_MM)
-            if cover == 2:
-                kwargs.update(rect_xmin=f(self.sph_edt_rxmin, "X_min"),
-                              rect_xmax=f(self.sph_edt_rxmax, "X_max"),
-                              rect_ymin=f(self.sph_edt_rymin, "Y_min"),
-                              rect_ymax=f(self.sph_edt_rymax, "Y_max"))
-            elif cover == 3:
-                kwargs.update(circ_R=f(self.sph_edt_cR, "圆形半径"),
-                              circ_xc=f(self.sph_edt_cxc, "圆心X"),
-                              circ_yc=f(self.sph_edt_cyc, "圆心Y"))
-        except ValueError as e:
-            QMessageBox.warning(self._main, "参数错误", str(e)); return
-        try:
-            pts = generate_spherical(**kwargs)
-        except ValueError as e:
-            QMessageBox.warning(self._main, "生成失败", str(e)); return
-        if not pts:
-            QMessageBox.warning(self._main, "警告", "未生成任何轨迹点"); return
-        tname = "栅形" if traj == "G" else "螺旋线"
-        surf_cn = "凸球面" if surf == "convex" else "凹球面"
-        geom = {"type": "spherical",
-                "R": R, "zc": zc, "h": h, "surf_type": surf,
-                "cover_type": cover,
-                "wall_thickness": SPHERICAL_WALL_THICKNESS_MM}
-        if cover == 2:
-            geom.update(rect_xmin=kwargs["rect_xmin"], rect_xmax=kwargs["rect_xmax"],
-                        rect_ymin=kwargs["rect_ymin"], rect_ymax=kwargs["rect_ymax"])
-        elif cover == 3:
-            geom.update(circ_R=kwargs["circ_R"],
-                        circ_xc=kwargs["circ_xc"], circ_yc=kwargs["circ_yc"])
-        params = {"surface_name": surf_cn, "traj_name": tname + "轨迹",
-                  "traj_type": traj, "direction": dire,
-                  "step_len": step_len, "line_spacing": line_spacing,
-                  "pitch": pitch, "arc_step": arc_step,
-                  "geom": geom}
-        self._finish(pts, params, self.sph_btn_save, self.sph_info_lbl,
-                     f"{surf_cn}{tname}轨迹", is_surface=True)
-
-    # ────────────────────────────────────────────────────────────────
-    # 柱面页面
-    # ────────────────────────────────────────────────────────────────
-    def _build_cylindrical_page(self):
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        w = QWidget()
-        scroll.setWidget(w)
-        layout = QVBoxLayout(w)
-        layout.setSpacing(6)
-        layout.setContentsMargins(6, 6, 6, 6)
-
-        grp1 = QGroupBox("柱面几何参数")
-        g1 = QVBoxLayout(grp1)
-        self.cyl_cmb_axis = QComboBox()
-        self.cyl_cmb_axis.addItems(["轴线平行 Y 轴", "轴线平行 X 轴"])
-        combox_input(g1, "轴线方向：", self.cyl_cmb_axis)
-        self.cyl_cmb_type = QComboBox()
-        self.cyl_cmb_type.addItems(["凸柱外表面 (Convex)", "凹柱内表面 (Concave)"])
-        combox_input(g1, "曲面类型：", self.cyl_cmb_type)
-        self.cyl_edt_R,    row_R   = lineedit_input("圆柱截面半径 R (mm)：", "100")
-        self.cyl_edt_zc,   row_zc  = lineedit_input("圆柱截面圆心 Z：", "0")
-        self.cyl_edt_k,    row_k   = lineedit_input("切割平面高度 k：", "0")
-        self.cyl_edt_amin, row_an  = lineedit_input("轴线方向起点 (mm)：", "-50")
-        self.cyl_edt_amax, row_ax  = lineedit_input("轴线方向终点 (mm)：",  "50")
-        for row in [row_R, row_zc, row_k, row_an, row_ax]:
-            g1.addLayout(row)
-        layout.addWidget(grp1)
-
-        grp_cv = QGroupBox("覆盖范围")
-        gcv = QVBoxLayout(grp_cv)
-        self.cyl_cmb_cover = QComboBox()
-        self.cyl_cmb_cover.addItems([
-            "全部覆盖（完整柱面投影区域）",
-            "局部矩形区域",
-            "局部圆形区域",
-        ])
-        combox_input(gcv, "覆盖类型：", self.cyl_cmb_cover)
-
-        self.cyl_lbl_rect = QLabel("── 矩形区域参数 ──")
-        gcv.addWidget(self.cyl_lbl_rect)
-        self.cyl_edt_rxmin, row_rxn = lineedit_input("X_min (mm)：", "-50")
-        self.cyl_edt_rxmax, row_rxx = lineedit_input("X_max (mm)：",  "50")
-        self.cyl_edt_rymin, row_ryn = lineedit_input("Y_min (mm)：", "-50")
-        self.cyl_edt_rymax, row_ryx = lineedit_input("Y_max (mm)：",  "50")
-        self.cyl_wrap_rect = QWidget()
-        wr = QVBoxLayout(self.cyl_wrap_rect)
-        wr.setContentsMargins(0, 0, 0, 0); wr.setSpacing(2)
-        for row in [row_rxn, row_rxx, row_ryn, row_ryx]:
-            wr.addLayout(row)
-        gcv.addWidget(self.cyl_wrap_rect)
-
-        self.cyl_lbl_circ = QLabel("── 圆形区域参数 ──")
-        gcv.addWidget(self.cyl_lbl_circ)
-        self.cyl_edt_cR,  row_cR  = lineedit_input("圆形半径 (mm)：", "50")
-        self.cyl_edt_cxc, row_cxc = lineedit_input("圆心 X (mm)：",   "0")
-        self.cyl_edt_cyc, row_cyc = lineedit_input("圆心 Y (mm)：",   "0")
-        self.cyl_wrap_circ = QWidget()
-        wc = QVBoxLayout(self.cyl_wrap_circ)
-        wc.setContentsMargins(0, 0, 0, 0); wc.setSpacing(2)
-        for row in [row_cR, row_cxc, row_cyc]:
-            wc.addLayout(row)
-        gcv.addWidget(self.cyl_wrap_circ)
-        layout.addWidget(grp_cv)
-
-        grp3 = QGroupBox("轨迹参数")
-        g3 = QVBoxLayout(grp3)
-        self.cyl_cmb_traj = QComboBox()
-        self.cyl_cmb_traj.addItems(["栅形轨迹 (Raster)", "螺旋线轨迹 (Spiral)"])
-        combox_input(g3, "轨迹类型：", self.cyl_cmb_traj)
-        self.cyl_cmb_dir = QComboBox()
-        self.cyl_cmb_dir.addItems(["X方向步进", "Y方向步进"])
-        combox_input(g3, "栅形方向：", self.cyl_cmb_dir)
-        self.cyl_edt_spacing = QLineEdit("2")
-        self.cyl_edt_step = QLineEdit("1")
-        self.cyl_edt_pitch = QLineEdit("2")
-        self.cyl_edt_arcstep = QLineEdit("1")
-        for hidden in [self.cyl_edt_spacing, self.cyl_edt_step,
-                       self.cyl_edt_pitch, self.cyl_edt_arcstep]:
-            hidden.setParent(self)
-            hidden.setVisible(False)
-        layout.addWidget(grp3)
-
-        grp4 = QGroupBox("输出设置")
-        g4 = QVBoxLayout(grp4)
-        self.cyl_edt_fname, row_fn = lineedit_input("文件名：", "cylindrical_traj")
-        g4.addLayout(row_fn)
-        layout.addWidget(grp4)
-
-        ctrl_grp, self.cyl_ctrl_step, self.cyl_ctrl_spacing = self._build_surface_control_group()
-        layout.addWidget(ctrl_grp)
-
-        btn_row = QHBoxLayout()
-        self.cyl_btn_gen  = QPushButton("生成轨迹")
-        self.cyl_btn_save = QPushButton("保存 TXT")
-        self.cyl_btn_save.setEnabled(False)
-        btn_row.addWidget(self.cyl_btn_gen)
-        btn_row.addWidget(self.cyl_btn_save)
-        layout.addLayout(btn_row)
-        layout.addWidget(divider())
-        self.cyl_info_lbl = QLabel("")
-        self.cyl_info_lbl.setWordWrap(True)
-        layout.addWidget(self.cyl_info_lbl)
-        layout.addStretch()
-
-        self.cyl_cmb_traj.currentIndexChanged.connect(self._cyl_traj_changed)
-        self.cyl_cmb_cover.currentIndexChanged.connect(self._cyl_cover_changed)
-        self.cyl_btn_gen.clicked.connect(self._do_generate_cylindrical)
-        self.cyl_btn_save.clicked.connect(
-            lambda: self._do_save("柱面轨迹", self.cyl_edt_fname.text(), is_surface=True))
-        self._cyl_traj_changed()
-        self._cyl_cover_changed()
-        return scroll
-
-    def _cyl_traj_changed(self):
-        is_raster = (self.cyl_cmb_traj.currentIndex() == 0)
-        self.cyl_cmb_dir.setVisible(is_raster)
-        self.cyl_edt_spacing.setVisible(False)
-        self.cyl_edt_step.setVisible(False)
-        self.cyl_edt_pitch.setVisible(False)
-        self.cyl_edt_arcstep.setVisible(False)
-
-    def _cyl_cover_changed(self):
-        idx = self.cyl_cmb_cover.currentIndex()
-        show_rect = (idx == 1)
-        show_circ = (idx == 2)
-        self.cyl_lbl_rect.setVisible(show_rect)
-        self.cyl_wrap_rect.setVisible(show_rect)
-        self.cyl_lbl_circ.setVisible(show_circ)
-        self.cyl_wrap_circ.setVisible(show_circ)
-
-    def _do_generate_cylindrical(self):
-        def f(e, n):
-            try: return float(e.text())
-            except: raise ValueError(f"参数「{n}」输入无效")
-        try:
-            R     = f(self.cyl_edt_R,    "圆柱半径R")
-            zc    = f(self.cyl_edt_zc,   "圆柱圆心Z")
-            k_cut = f(self.cyl_edt_k,    "切割平面k")
-            amin  = f(self.cyl_edt_amin, "轴线起点")
-            amax  = f(self.cyl_edt_amax, "轴线终点")
-            axis  = "Y" if self.cyl_cmb_axis.currentIndex() == 0 else "X"
-            surf  = "C" if self.cyl_cmb_type.currentIndex() == 0 else "V"
-            cover = self.cyl_cmb_cover.currentIndex() + 1
-            traj  = "G" if self.cyl_cmb_traj.currentIndex() == 0 else "S"
-            dire  = "X" if self.cyl_cmb_dir.currentIndex()  == 0 else "Y"
-            step_len, line_spacing, pitch, arc_step = self._read_surface_step_spacing(
-                self.cyl_ctrl_step, self.cyl_ctrl_spacing)
-            coverage = {"cover_type": cover}
-            if cover == 2:
-                coverage.update(
-                    rect_xmin=f(self.cyl_edt_rxmin, "X_min"),
-                    rect_xmax=f(self.cyl_edt_rxmax, "X_max"),
-                    rect_ymin=f(self.cyl_edt_rymin, "Y_min"),
-                    rect_ymax=f(self.cyl_edt_rymax, "Y_max"))
-            elif cover == 3:
-                coverage.update(
-                    circ_R=f(self.cyl_edt_cR, "圆形半径"),
-                    circ_xc=f(self.cyl_edt_cxc, "圆心X"),
-                    circ_yc=f(self.cyl_edt_cyc, "圆心Y"))
-        except ValueError as e:
-            QMessageBox.warning(self._main, "参数错误", str(e)); return
-        try:
-            pts = generate_cylindrical(R=R, zc=zc, k_cut=k_cut,
-                                       axis_dir=axis, surf_type=surf,
-                                       axis_min=amin, axis_max=amax,
-                                       traj_type=traj, direction=dire,
-                                       step_len=step_len, line_spacing=line_spacing,
-                                       pitch=pitch, arc_step=arc_step,
-                                       wall_thickness=CYLINDRICAL_WALL_THICKNESS_MM,
-                                       **coverage)
-        except ValueError as e:
-            QMessageBox.warning(self._main, "生成失败", str(e)); return
-        if not pts:
-            QMessageBox.warning(self._main, "警告", "未生成任何轨迹点"); return
-        tname = "栅形" if traj == "G" else "螺旋线"
-        surf_cn = "凸柱面" if surf == "C" else "凹柱面"
-        geom = {"type": "cylindrical",
-                "R": R, "zc": zc, "k_cut": k_cut,
-                "axis_dir": axis, "surf_type": surf,
-                "axis_min": amin, "axis_max": amax,
-                "cover_type": cover,
-                "wall_thickness": CYLINDRICAL_WALL_THICKNESS_MM}
-        geom.update(coverage)
-        params = {"surface_name": surf_cn, "traj_name": tname + "轨迹",
-                  "traj_type": traj, "direction": dire,
-                  "step_len": step_len, "line_spacing": line_spacing,
-                  "pitch": pitch, "arc_step": arc_step,
-                  "geom": geom}
-        self._finish(pts, params, self.cyl_btn_save, self.cyl_info_lbl,
-                     f"{surf_cn}{tname}轨迹", is_surface=True)
-
-    # ────────────────────────────────────────────────────────────────
-    # 锥面页面
-    # ────────────────────────────────────────────────────────────────
-    def _build_conical_page(self):
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        w = QWidget()
-        scroll.setWidget(w)
-        layout = QVBoxLayout(w)
-        layout.setSpacing(6)
-        layout.setContentsMargins(6, 6, 6, 6)
-
-        grp1 = QGroupBox("锥面参数")
-        g1 = QVBoxLayout(grp1)
-        self.con_cmb_type = QComboBox()
-        self.con_cmb_type.addItems(["凸锥 (Convex Cone)", "凹锥 (Concave Cone)"])
-        combox_input(g1, "锥体类型：", self.con_cmb_type)
-        self.con_edt_alpha, row_al = lineedit_input("半顶角 α (度)：", "30")
-        self.con_edt_H,     row_H  = lineedit_input("高度 H (正数, mm)：", "100")
-        g1.addLayout(row_al); g1.addLayout(row_H)
-        layout.addWidget(grp1)
-
-        grp2 = QGroupBox("覆盖范围")
-        g2 = QVBoxLayout(grp2)
-        self.con_cmb_cover = QComboBox()
-        self.con_cmb_cover.addItems([
-            "全部覆盖（整个底面圆）",
-            "局部矩形区域",
-            "局部圆形区域",
-        ])
-        combox_input(g2, "覆盖类型：", self.con_cmb_cover)
-
-        self.con_lbl_rect = QLabel("── 矩形区域参数 ──")
-        g2.addWidget(self.con_lbl_rect)
-        self.con_edt_rxmin, row_rxn = lineedit_input("X_min (mm)：", "-50")
-        self.con_edt_rxmax, row_rxx = lineedit_input("X_max (mm)：",  "50")
-        self.con_edt_rymin, row_ryn = lineedit_input("Y_min (mm)：", "-50")
-        self.con_edt_rymax, row_ryx = lineedit_input("Y_max (mm)：",  "50")
-        self.con_wrap_rect = QWidget()
-        wr = QVBoxLayout(self.con_wrap_rect)
-        wr.setContentsMargins(0, 0, 0, 0); wr.setSpacing(2)
-        for row in [row_rxn, row_rxx, row_ryn, row_ryx]:
-            wr.addLayout(row)
-        g2.addWidget(self.con_wrap_rect)
-
-        self.con_lbl_circ = QLabel("── 圆形区域参数 ──")
-        g2.addWidget(self.con_lbl_circ)
-        self.con_edt_cR,  row_cR  = lineedit_input("圆形半径 (mm)：", "50")
-        self.con_edt_cxc, row_cxc = lineedit_input("圆心 X (mm)：",   "0")
-        self.con_edt_cyc, row_cyc = lineedit_input("圆心 Y (mm)：",   "0")
-        self.con_wrap_circ = QWidget()
-        wc = QVBoxLayout(self.con_wrap_circ)
-        wc.setContentsMargins(0, 0, 0, 0); wc.setSpacing(2)
-        for row in [row_cR, row_cxc, row_cyc]:
-            wc.addLayout(row)
-        g2.addWidget(self.con_wrap_circ)
-        layout.addWidget(grp2)
-
-        grp3 = QGroupBox("轨迹参数")
-        g3 = QVBoxLayout(grp3)
-        self.con_cmb_traj = QComboBox()
-        self.con_cmb_traj.addItems(["栅形轨迹 (Raster)", "螺旋线轨迹 (Spiral)"])
-        combox_input(g3, "轨迹类型：", self.con_cmb_traj)
-        self.con_cmb_dir = QComboBox()
-        self.con_cmb_dir.addItems(["X方向 (平行X轴)", "Y方向 (平行Y轴)"])
-        combox_input(g3, "栅形方向：", self.con_cmb_dir)
-        self.con_edt_spacing = QLineEdit("2")
-        self.con_edt_step = QLineEdit("1")
-        self.con_edt_pitch = QLineEdit("2")
-        self.con_edt_arcstep = QLineEdit("1")
-        for hidden in [self.con_edt_spacing, self.con_edt_step,
-                       self.con_edt_pitch, self.con_edt_arcstep]:
-            hidden.setParent(self)
-            hidden.setVisible(False)
-        layout.addWidget(grp3)
-
-        grp4 = QGroupBox("输出设置")
-        g4 = QVBoxLayout(grp4)
-        self.con_edt_fname, row_fn = lineedit_input("文件名：", "conical_traj")
-        g4.addLayout(row_fn)
-        layout.addWidget(grp4)
-
-        ctrl_grp, self.con_ctrl_step, self.con_ctrl_spacing = self._build_surface_control_group()
-        layout.addWidget(ctrl_grp)
-
-        btn_row = QHBoxLayout()
-        self.con_btn_gen  = QPushButton("生成轨迹")
-        self.con_btn_save = QPushButton("保存 TXT")
-        self.con_btn_save.setEnabled(False)
-        btn_row.addWidget(self.con_btn_gen)
-        btn_row.addWidget(self.con_btn_save)
-        layout.addLayout(btn_row)
-        layout.addWidget(divider())
-        self.con_info_lbl = QLabel("")
-        self.con_info_lbl.setWordWrap(True)
-        layout.addWidget(self.con_info_lbl)
-        layout.addStretch()
-
-        self.con_cmb_cover.currentIndexChanged.connect(self._con_cover_changed)
-        self.con_cmb_traj.currentIndexChanged.connect(self._con_traj_changed)
-        self.con_btn_gen.clicked.connect(self._do_generate_conical)
-        self.con_btn_save.clicked.connect(
-            lambda: self._do_save("锥面轨迹", self.con_edt_fname.text(), is_surface=True))
-        self._con_cover_changed()
-        self._con_traj_changed()
-        return scroll
-
-    def _con_cover_changed(self):
-        idx = self.con_cmb_cover.currentIndex()
-        show_rect = (idx == 1)
-        show_circ = (idx == 2)
-        self.con_lbl_rect.setVisible(show_rect)
-        self.con_wrap_rect.setVisible(show_rect)
-        self.con_lbl_circ.setVisible(show_circ)
-        self.con_wrap_circ.setVisible(show_circ)
-
-    def _con_traj_changed(self):
-        is_raster = (self.con_cmb_traj.currentIndex() == 0)
-        self.con_cmb_dir.setVisible(is_raster)
-        self.con_edt_spacing.setVisible(False)
-        self.con_edt_step.setVisible(False)
-        self.con_edt_pitch.setVisible(False)
-        self.con_edt_arcstep.setVisible(False)
-
-    def _do_generate_conical(self):
-        def f(e, n):
-            try: return float(e.text())
-            except: raise ValueError(f"参数「{n}」输入无效")
-        try:
-            alpha = f(self.con_edt_alpha, "半顶角α")
-            H     = f(self.con_edt_H,     "高度H")
-            ctype = self.con_cmb_type.currentIndex()  + 1  # 1=凸, 2=凹
-            cover = self.con_cmb_cover.currentIndex() + 1  # 1/2/3
-            traj  = "G" if self.con_cmb_traj.currentIndex() == 0 else "S"
-            dire  = "X" if self.con_cmb_dir.currentIndex()  == 0 else "Y"
-            step_len, line_spacing, pitch, arc_step = self._read_surface_step_spacing(
-                self.con_ctrl_step, self.con_ctrl_spacing)
-            kwargs = dict(cone_type=ctype, alpha_deg=alpha, H=H,
-                          cover_type=cover, traj_type=traj, direction=dire,
-                          step_len=step_len, line_spacing=line_spacing,
-                          pitch=pitch, arc_step=arc_step)
-            if cover == 2:
-                kwargs.update(rect_xmin=f(self.con_edt_rxmin,"X_min"),
-                              rect_xmax=f(self.con_edt_rxmax,"X_max"),
-                              rect_ymin=f(self.con_edt_rymin,"Y_min"),
-                              rect_ymax=f(self.con_edt_rymax,"Y_max"))
-            elif cover == 3:
-                kwargs.update(circ_R=f(self.con_edt_cR,"圆形半径"),
-                              circ_xc=f(self.con_edt_cxc,"圆心X"),
-                              circ_yc=f(self.con_edt_cyc,"圆心Y"))
-        except ValueError as e:
-            QMessageBox.warning(self._main, "参数错误", str(e)); return
-        try:
-            pts = generate_conical(**kwargs)
-        except ValueError as e:
-            QMessageBox.warning(self._main, "生成失败", str(e)); return
-        if not pts:
-            QMessageBox.warning(self._main, "警告", "未生成任何轨迹点"); return
-        tname = "栅形" if traj == "G" else "螺旋线"
-        surf_cn = "凸锥面" if ctype == 1 else "凹锥面"
-        geom = {"type": "conical", "cone_type": ctype, "alpha_deg": alpha,
-                "H": H, "cover_type": cover}
-        if cover == 2:
-            geom.update(rect_xmin=kwargs["rect_xmin"], rect_xmax=kwargs["rect_xmax"],
-                        rect_ymin=kwargs["rect_ymin"], rect_ymax=kwargs["rect_ymax"])
-        elif cover == 3:
-            geom.update(circ_R=kwargs["circ_R"], circ_xc=kwargs["circ_xc"],
-                        circ_yc=kwargs["circ_yc"])
-        params = {"surface_name": surf_cn, "traj_name": tname + "轨迹", "geom": geom}
-        self._finish(pts, params, self.con_btn_save, self.con_info_lbl,
-                     f"{surf_cn}{tname}轨迹", is_surface=True)
-
-
-# ════════════════════════════════════════════════════════════════════
-# 主窗口
-# ════════════════════════════════════════════════════════════════════
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -2974,6 +1783,25 @@ class MainWindow(QMainWindow):
         pane_save.add_ribbon_widget(RibbonButton(self, act_save, True))
         tab_traj.add_spacer()
 
+        # ── Tab：驻留时间 ────────────────────────────────────────────
+        # 按 appCNCFinishingV6.mlapp 的工作流排列，位于轨迹规划与授权之间。
+        tab_dwell = self._ribbon.add_ribbon_tab("驻留时间")
+        dwell_actions = [
+            ("初始设置", "gear", "设置抛光工具、工艺阶段和计算网格",
+             self._show_dwell_initial),
+            ("建模", "3d", "设置待加工曲面与口径参数", self._show_dwell_model),
+            ("面形数据", "data", "导入和处理面形数据", self._show_dwell_surface),
+            ("抛光斑", "central", "导入抛光斑并设置去除函数", self._show_dwell_spot),
+            ("驻留时间求解", "gear", "仅使用最小二乘法求解驻留时间",
+             self._show_dwell_solve),
+            ("CNC程序生成", "NC", "生成和保存 CNC 程序", self._show_dwell_cnc),
+        ]
+        for caption, icon, tip, slot in dwell_actions:
+            pane = tab_dwell.add_ribbon_pane(caption)
+            action = self._make_action(caption, icon, tip, slot)
+            pane.add_ribbon_widget(RibbonButton(self, action, True))
+        tab_dwell.add_spacer()
+
         # ── Tab：授权 ──────────────────────────────────────────────
         tab_lic = self._ribbon.add_ribbon_tab("authorization")
         pane_lic = tab_lic.add_ribbon_pane("授权管理")
@@ -3003,6 +1831,24 @@ class MainWindow(QMainWindow):
 
     def _show_surface(self):
         self.stacked_widget.setCurrentIndex(self.stacked_widget.idx_surface)
+
+    def _show_dwell_initial(self):
+        self.stacked_widget.setCurrentIndex(self.stacked_widget.idx_dwell_initial)
+
+    def _show_dwell_model(self):
+        self.stacked_widget.setCurrentIndex(self.stacked_widget.idx_dwell_model)
+
+    def _show_dwell_surface(self):
+        self.stacked_widget.setCurrentIndex(self.stacked_widget.idx_dwell_surface)
+
+    def _show_dwell_spot(self):
+        self.stacked_widget.setCurrentIndex(self.stacked_widget.idx_dwell_spot)
+
+    def _show_dwell_solve(self):
+        self.stacked_widget.setCurrentIndex(self.stacked_widget.idx_dwell_solve)
+
+    def _show_dwell_cnc(self):
+        self.stacked_widget.setCurrentIndex(self.stacked_widget.idx_dwell_cnc)
 
     def _import_stl_model(self):
         path, _ = QFileDialog.getOpenFileName(
