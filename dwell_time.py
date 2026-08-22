@@ -381,9 +381,10 @@ class DwellTimeEngine:
         old_x = (np.arange(cols) - (cols - 1) / 2.0) * old_dx + x_offset
         old_y = (np.arange(rows) - (rows - 1) / 2.0) * old_dy + y_offset
         if cols > 1 and rows > 1:
-            ellipse = ((old_x[None, :] - x_offset) / max(abs(old_x[-1] - x_offset), 1e-12)) ** 2
-            ellipse += ((old_y[:, None] - y_offset) / max(abs(old_y[-1] - y_offset), 1e-12)) ** 2
-            source[ellipse >= 1.0] = 0.0
+            # 椭圆掩膜按广播方式合成，避免 (1,cols) 原地 += (rows,1) 触发形状错误
+            ellipse_x = ((old_x - x_offset) / max(abs(old_x[-1] - x_offset), 1e-12)) ** 2
+            ellipse_y = ((old_y - y_offset) / max(abs(old_y[-1] - y_offset), 1e-12)) ** 2
+            source[ellipse_y[:, None] + ellipse_x[None, :] >= 1.0] = 0.0
         half_x = max(abs(old_x[0]), abs(old_x[-1])); half_y = max(abs(old_y[0]), abs(old_y[-1]))
         new_x = _odd_axis(half_x, dx); new_y = _odd_axis(half_y, dy)
         horizontal = cls._interp_axis(source, old_x, new_x, axis=1)
@@ -442,12 +443,14 @@ class DwellTimeEngine:
             new_momentum = (1.0 + math.sqrt(1.0 + 4.0 * momentum * momentum)) / 2.0
             accelerated = candidate + ((momentum - 1.0) / new_momentum) * (candidate - dwell)
             accelerated[~trajectory_mask] = 0.0
-            delta = np.linalg.norm(candidate - dwell)
-            scale = max(np.linalg.norm(dwell), 1.0)
+            # 不用 np.linalg.norm：其底层 BLAS 在部分环境会崩溃，逐元素范数更稳
+            diff = candidate - dwell
+            delta = float(np.sqrt(np.sum(diff * diff)))
+            scale = max(float(np.sqrt(np.sum(dwell * dwell))), 1.0)
             dwell = candidate; estimate = accelerated; momentum = new_momentum
             if len(objective) < 20 or len(objective) % 10 == 0:
                 residual_now = removal_est[evaluation_mask] - target[evaluation_mask]
-                objective.append(float(np.dot(residual_now, residual_now)))
+                objective.append(float(np.sum(residual_now * residual_now)))
             if delta / scale < tolerance:
                 break
         removal = cls.fft_convolve_same(dwell, kernel)
@@ -579,8 +582,8 @@ class DwellTimeMixin:
         self._dwell_state = {
             "dx": 1.0, "dy": 1.0, "model": None, "surface_raw": None,
             "surface": None, "surface_pixel": None, "spot_raw": None,
-            "spot_pixel": None, "spot": None, "solution": None,
-            "trajectory": None, "cnc": None,
+            "spot_pixel": None, "spot_before": None, "spot": None,
+            "solution": None, "trajectory": None, "cnc": None,
         }
 
     @staticmethod
@@ -963,7 +966,7 @@ class DwellTimeMixin:
 
     def _build_dwell_surface_page(self):
         scroll, layout = self._dwell_scroll_page(
-            "面形数据", "读取 Zygo DAT、NPY、CSV 或规则文本网格，并执行裁边、均值滤波、RMS 滤波和延拓。")
+            "面形数据", "读取实际面形误差，并执行滤波、延拓等后处理操作。")
 
         # ── 数据导入：选择文件后读入面形矩阵 ──
         import_group = QGroupBox("数据导入"); import_form = QVBoxLayout(import_group)
@@ -972,6 +975,10 @@ class DwellTimeMixin:
         ])
         select = QPushButton("选择面形数据文件"); select.clicked.connect(self._dwell_select_surface)
         import_form.addWidget(select)
+        pv_hint = QLabel("导入后自动计算 PV 与 RMS：PV 为面形最高点与最低点之差，RMS 为整体面形偏差的均方根。")
+        pv_hint.setStyleSheet("color:#50647a; font-size:11px;")
+        pv_hint.setWordWrap(True)
+        import_form.addWidget(pv_hint)
         layout.addWidget(import_group)
 
         # ── 处理参数：裁边、延拓与滤波 ──
@@ -979,9 +986,21 @@ class DwellTimeMixin:
         self._dwell_add_fields(process_form, [
             ("dw_surface_trim", "裁边尺寸 (mm)：", "0"),
             ("dw_surface_extend", "延拓尺寸 (mm)：", "0"),
+        ])
+        self._dwell_add_fields(process_form, [
             ("dw_surface_filter", "均值滤波窗尺寸 (mm)：", "2"),
+        ])
+        filter_hint = QLabel("将窗口内平均值替换各点，以平滑高频噪声。")
+        filter_hint.setStyleSheet("color:#50647a; font-size:11px;")
+        filter_hint.setWordWrap(True)
+        process_form.addWidget(filter_hint)
+        self._dwell_add_fields(process_form, [
             ("dw_surface_rms", "RMS 倍数：", "3"),
         ])
+        rms_hint = QLabel("偏离均值大于RMS倍数×RMS的点压回阈值，抑制坏点与突变。")
+        rms_hint.setStyleSheet("color:#50647a; font-size:11px;")
+        rms_hint.setWordWrap(True)
+        process_form.addWidget(rms_hint)
         layout.addWidget(process_group)
 
         # ── 网格间距（只读，来自初始设置）──
@@ -1088,6 +1107,11 @@ class DwellTimeMixin:
             ("dw_spot_xoffset", "X 偏置 (mm)：", "0"),
             ("dw_spot_yoffset", "Y 偏置 (mm)：", "0"),
         ])
+        offset_hint = QLabel(
+            "若采斑时斑点不完全居中，X/Y 偏置用于抛光斑重新对中")
+        offset_hint.setStyleSheet("color:#50647a; font-size:11px;")
+        offset_hint.setWordWrap(True)
+        sample_form.addWidget(offset_hint)
         layout.addWidget(sample_group)
 
         # ── 计算网格（只读，来自初始设置）──
@@ -1110,10 +1134,28 @@ class DwellTimeMixin:
         if not path: return
         try:
             raw, pixel = DwellTimeEngine.read_grid(path)
+            before = -np.asarray(raw, dtype=float)
+            if np.isfinite(before).any():
+                before = before - np.nanmin(before)
             self.dw_spot_file.setText(path)
-            self._dwell_state.update(spot_raw=raw, spot_pixel=pixel, spot=None)
+            self._dwell_state.update(spot_raw=raw, spot_pixel=pixel,
+                                     spot_before=before, spot=None)
             self._dwell_report(f"抛光斑原始数据已读取：{raw.shape[1]}×{raw.shape[0]}。", self.dw_spot_info)
+            self._dwell_refresh_spot_preview()
         except Exception as exc: self._dwell_error("抛光斑读取失败", exc, self.dw_spot_info)
+
+    def _dwell_refresh_spot_preview(self):
+        """把抛光斑数据同步到左侧二维预览（左=取反后处理前，右=去除函数处理后）。"""
+        before = self._dwell_state.get("spot_before")
+        if before is None:
+            return
+        spot = self._dwell_state.get("spot")
+        after = spot["kernel"] if spot is not None else before
+        try:
+            self._main.preview.plot_dwell_surface(
+                before, after, "处理前", "处理后", colorbar_label="抛光斑数据")
+        except Exception as exc:
+            self._dwell_report(f"二维预览失败：{exc}", self.dw_spot_info, error=True)
 
     def _dwell_calculate_spot(self):
         try:
@@ -1131,29 +1173,14 @@ class DwellTimeMixin:
                 f"去除函数计算完成：{spot['kernel'].shape[1]}×{spot['kernel'].shape[0]}，"
                 f"脉冲={spot['impulse']:.6g}，体去除效率={spot['volume_efficiency']:.6g} mm³/min。",
                 self.dw_spot_info)
+            self._dwell_refresh_spot_preview()
         except Exception as exc: self._dwell_error("去除函数计算失败", exc, self.dw_spot_info)
 
     def _build_dwell_solve_page(self):
         scroll, layout = self._dwell_scroll_page(
-            "驻留时间求解", "仅保留带上下限约束的最小二乘法；脉冲迭代法和均抛求解路径均已删除。")
+            "驻留时间求解", "先设置区域裁边与求解算法，求解驻留时间并可对结果做边缘修饰。")
 
-        # ── 求解方法 ──
-        method_group = QGroupBox("求解方法"); method_layout = QVBoxLayout(method_group)
-        self.dw_solver_method = QLineEdit("最小二乘法"); self.dw_solver_method.setReadOnly(True)
-        self.dw_solver_method.setStyleSheet("background:#e8f0fa; color:#10243f;")
-        row = QHBoxLayout(); row.addWidget(QLabel("方法：")); row.addWidget(self.dw_solver_method)
-        method_layout.addLayout(row); layout.addWidget(method_group)
-
-        # ── 驻留约束 ──
-        constraint_group = QGroupBox("驻留约束"); constraint_form = QVBoxLayout(constraint_group)
-        self._dwell_add_fields(constraint_form, [
-            ("dw_uniform", "均抛厚度：", "0.5"),
-            ("dw_max_dwell", "最大驻留时间 (s)：", "20"),
-            ("dw_min_dwell", "最小驻留时间 (s)：", "0.02"),
-        ])
-        layout.addWidget(constraint_group)
-
-        # ── 区域裁边 ──
+        # ── 区域裁边：轨迹区/评价区由裁边量定义，是求解的前置输入，放最上面 ──
         trim_group = QGroupBox("区域裁边"); trim_form = QVBoxLayout(trim_group)
         self._dwell_add_fields(trim_form, [
             ("dw_traj_margin", "轨迹区裁边 (mm)：", "0"),
@@ -1161,14 +1188,42 @@ class DwellTimeMixin:
         ])
         layout.addWidget(trim_group)
 
-        # ── 迭代与网格（X/Y 间距只读，来自初始设置）──
-        iter_group = QGroupBox("迭代与网格"); iter_form = QVBoxLayout(iter_group)
-        self._dwell_add_fields(iter_form, [
-            ("dw_solve_iterations", "最大迭代次数：", "300"),
-            ("dw_solve_tolerance", "收敛阈值：", "1e-6"),
-            ("dw_solve_dx", "X 间距 (mm)：", "1"), ("dw_solve_dy", "Y 间距 (mm)：", "1"),
-        ], readonly=("dw_solve_dx", "dw_solve_dy"))
-        layout.addWidget(iter_group)
+        # ── 求解方法：下拉选择算法，下方动态显示对应参数（仿建模页口径/面形类型）──
+        method_group = QGroupBox("求解方法"); method_form = QVBoxLayout(method_group)
+        self.dw_solver_method = QComboBox()
+        self.dw_solver_method.addItems(["—— 请选择算法类型 ——", "最小二乘法", "脉冲迭代法"])
+        combox_input(method_form, "算法类型：", self.dw_solver_method)
+        # 共用参数：两种算法都需要（与 MATLAB 一致）
+        self.dw_box_uniform = self._dwell_field_box(
+            method_form, "dw_uniform", "均抛厚度：", "0.5")
+        self.dw_box_max_dwell = self._dwell_field_box(
+            method_form, "dw_max_dwell", "最大驻留时间 (s)：", "20")
+        self.dw_box_min_dwell = self._dwell_field_box(
+            method_form, "dw_min_dwell", "最小驻留时间 (s)：", "0.02")
+        # 最小二乘法专用参数
+        self.dw_box_ls_iterations = self._dwell_field_box(
+            method_form, "dw_solve_iterations", "最大迭代次数：", "300")
+        self.dw_box_ls_tolerance = self._dwell_field_box(
+            method_form, "dw_solve_tolerance", "收敛阈值：", "1e-6")
+        # 脉冲迭代法专用参数与备注（算法暂不可用）
+        self.dw_box_pulse_iterations = self._dwell_field_box(
+            method_form, "dw_pulse_iterations", "迭代次数：", "300")
+        self.dw_box_pulse_hint = QWidget()
+        pulse_hint_layout = QVBoxLayout(self.dw_box_pulse_hint)
+        pulse_hint_layout.setContentsMargins(0, 0, 0, 0); pulse_hint_layout.setSpacing(0)
+        pulse_hint = QLabel("备注：脉冲迭代法暂不可用，请选择最小二乘法求解。")
+        pulse_hint.setStyleSheet("color:#50647a; font-size:11px;")
+        pulse_hint.setWordWrap(True)
+        pulse_hint_layout.addWidget(pulse_hint)
+        method_form.addWidget(self.dw_box_pulse_hint)
+        self._solve_box_attrs = (
+            "dw_box_uniform", "dw_box_max_dwell", "dw_box_min_dwell",
+            "dw_box_ls_iterations", "dw_box_ls_tolerance",
+            "dw_box_pulse_iterations", "dw_box_pulse_hint",
+        )
+        self.dw_solver_method.currentIndexChanged.connect(self._dwell_solve_sync_visibility)
+        self._dwell_solve_sync_visibility()
+        layout.addWidget(method_group)
 
         # ── 边缘修饰 ──
         modify_group = QGroupBox("边缘修饰"); modify_form = QVBoxLayout(modify_group)
@@ -1178,8 +1233,15 @@ class DwellTimeMixin:
         ])
         layout.addWidget(modify_group)
 
+        # ── 计算网格（单独放，只读，来自初始设置）──
+        grid_group = QGroupBox("计算网格"); grid_form = QVBoxLayout(grid_group)
+        self._dwell_add_fields(grid_form, [
+            ("dw_solve_dx", "X 间距 (mm)：", "1"), ("dw_solve_dy", "Y 间距 (mm)：", "1"),
+        ], readonly=("dw_solve_dx", "dw_solve_dy"))
+        layout.addWidget(grid_group)
+
         row = QHBoxLayout()
-        solve = QPushButton("最小二乘法求解驻留时间")
+        solve = QPushButton("求解驻留时间")
         modify = QPushButton("驻留时间修饰")
         row.addWidget(solve); row.addWidget(modify); layout.addLayout(row)
         self.dw_solve_info = QLabel(""); self.dw_solve_info.setWordWrap(True)
@@ -1188,8 +1250,23 @@ class DwellTimeMixin:
         modify.clicked.connect(self._do_dwell_modify)
         return scroll
 
+    def _dwell_solve_sync_visibility(self, *_args):
+        """按算法下拉框的当前选择，只显示该算法需要填写的参数行（仿建模页）。"""
+        shared = ("dw_box_uniform", "dw_box_max_dwell", "dw_box_min_dwell")
+        shown = {
+            "最小二乘法": shared + ("dw_box_ls_iterations", "dw_box_ls_tolerance"),
+            "脉冲迭代法": shared + ("dw_box_pulse_iterations", "dw_box_pulse_hint"),
+        }.get(self.dw_solver_method.currentText(), ())
+        for attr in self._solve_box_attrs:
+            getattr(self, attr).setVisible(attr in shown)
+
     def _do_dwell_least_squares(self):
         try:
+            method = self.dw_solver_method.currentText()
+            if method == "—— 请选择算法类型 ——":
+                raise ValueError("请先选择算法类型")
+            if method != "最小二乘法":
+                raise ValueError("脉冲迭代法暂不可用，请选择最小二乘法求解")
             surface = self._dwell_state.get("surface"); spot = self._dwell_state.get("spot")
             if surface is None: raise ValueError("请先完成面形数据导入与处理")
             if spot is None: raise ValueError("请先计算抛光斑去除函数")
@@ -1208,7 +1285,33 @@ class DwellTimeMixin:
             self._dwell_report(
                 f"最小二乘求解完成：RMS {solution['before_rms']:.6g} → {solution['after_rms']:.6g}，"
                 f"记录 {len(solution['objective'])} 个收敛检查点。", self.dw_solve_info)
+            self._dwell_refresh_solve_preview()
         except Exception as exc: self._dwell_error("驻留时间求解失败", exc, self.dw_solve_info)
+
+    def _dwell_refresh_solve_preview(self):
+        """把求解结果同步到左侧 2×2 四面板：
+        上排=加工前面形误差（评价区）/ 驻留时间（单位面积），
+        下排=仿真去除量 / 加工后残差（评价区）。"""
+        solution = self._dwell_state.get("solution")
+        if solution is None:
+            return
+        eva = solution["evaluation_mask"]
+        surf = solution["surface_mask"]
+        work = solution["residual"] + solution["removal"]
+        before = np.full_like(work, np.nan); before[eva] = work[eva]
+        removal = np.full_like(work, np.nan); removal[surf] = solution["removal"][surf]
+        residual = np.full_like(work, np.nan); residual[eva] = solution["residual"][eva]
+        x = solution["x"]; y = solution["y"]
+        dx = float(x[1] - x[0]) if len(x) > 1 else 1.0
+        dy = float(y[1] - y[0]) if len(y) > 1 else 1.0
+        dwell = solution["dwell"] / max(dx * dy, 1e-12)
+        try:
+            self._main.preview.plot_dwell_solution(
+                [before, dwell, removal, residual],
+                ["加工前面形误差（评价区）", "驻留时间（单位面积）",
+                 "仿真去除量", "加工后残差（评价区）"])
+        except Exception as exc:
+            self._dwell_report(f"二维预览失败：{exc}", self.dw_solve_info, error=True)
 
     def _do_dwell_modify(self):
         try:
@@ -1229,8 +1332,34 @@ class DwellTimeMixin:
             maximum = self._dwell_float(self.dw_max_dwell, "最大驻留时间", 0.0)
             dwell[mask] = np.clip(dwell[mask], minimum, maximum)
             solution["dwell"] = dwell
-            self._dwell_report(f"边缘驻留时间修饰完成：调整 {np.count_nonzero(edge)} 个节点。", self.dw_solve_info)
+            # MATLAB 版修饰后只重画驻留时间一幅图；这里重算正仿真与残差，四幅图全部更新
+            self._dwell_resimulate(solution)
+            self._dwell_report(
+                f"边缘驻留时间修饰完成：调整 {np.count_nonzero(edge)} 个节点，"
+                f"修饰后 RMS {solution['before_rms']:.6g} → {solution['after_rms']:.6g}。",
+                self.dw_solve_info)
+            self._dwell_refresh_solve_preview()
         except Exception as exc: self._dwell_error("驻留时间修饰失败", exc, self.dw_solve_info)
+
+    def _dwell_resimulate(self, solution):
+        """驻留时间被修饰后，用当前抛光斑重新正仿真：去除量=驻留⊛去除函数，
+        残差=面形−去除量，并更新评价区前后 RMS。"""
+        spot = self._dwell_state.get("spot")
+        if spot is None:
+            return
+        dwell = np.where(np.isfinite(solution["dwell"]), solution["dwell"], 0.0)
+        removal = DwellTimeEngine.fft_convolve_same(dwell, spot["kernel"])
+        work = solution["residual"] + solution["removal"]
+        surf = solution["surface_mask"]
+        residual = np.full_like(work, np.nan)
+        residual[surf] = work[surf] - removal[surf]
+        eva = solution["evaluation_mask"]
+        before = work[eva]
+        after = residual[eva]
+        solution.update(
+            removal=removal, residual=residual,
+            before_rms=float(np.sqrt(np.mean((before - np.mean(before)) ** 2))),
+            after_rms=float(np.sqrt(np.mean((after - np.mean(after)) ** 2))))
 
     def _build_dwell_cnc_page(self):
         scroll, layout = self._dwell_scroll_page(

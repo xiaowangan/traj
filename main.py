@@ -20,7 +20,7 @@ import numpy as np
 from PyQt5 import QtWidgets, QtGui, QtCore
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QDockWidget, QStackedWidget,
-    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
+    QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QLineEdit,
     QPushButton, QComboBox, QGroupBox, QFileDialog, QMessageBox,
     QSizePolicy, QFrame, QScrollArea, QPlainTextEdit, QStyleFactory,
     QAction, QToolBar
@@ -83,7 +83,8 @@ def _downsample_2d(data, max_side=1536):
 
 
 class SurfaceDataPreview(QWidget):
-    """用两个独立 matplotlib 面板分别显示处理前/处理后面形热力图（仿轨迹规划的左右面板）。"""
+    """独立 matplotlib 热力图面板：面形/抛光斑页用 1×2 两面板，
+    驻留时间求解页用 2×2 四面板（上下各两个），颜色样式保持一致。"""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -93,23 +94,30 @@ class SurfaceDataPreview(QWidget):
         self._axes = []
         self._canvases = []
         self._panel_hosts = []
+        self._panel_count = 2
+        # 四面板（驻留时间求解）大小调节：左/右/下三边留白像素数，
+        # 数值越大四个图越小；顶部留白由横条避让自动决定，不在此处。
+        # 两面板页面不受此设置影响。
+        self._four_panel_inset = 0
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(4, 4, 4, 4)
         outer.setSpacing(0)
 
-        panels = QHBoxLayout()
-        panels.setContentsMargins(0, 0, 0, 0)
-        panels.setSpacing(2)
+        # 2×2 网格：两面板模式只显示第一行，四面板模式全部显示
+        self._panels = QGridLayout()
+        self._panels.setContentsMargins(0, 0, 0, 0)
+        self._panels.setSpacing(2)
 
         try:
             import matplotlib
             from matplotlib.figure import Figure
             from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg
-            for _ in range(2):
+            for index in range(4):
                 host = QWidget()
                 host_layout = QVBoxLayout(host)
                 host_layout.setContentsMargins(0, 0, 0, 0)
+                host.plot_layout = host_layout
                 figure = Figure(figsize=(3.6, 3.6), dpi=100)
                 figure.patch.set_facecolor("#dfe9f5")
                 canvas = FigureCanvasQTAgg(figure)
@@ -122,7 +130,9 @@ class SurfaceDataPreview(QWidget):
                 self._axes.append(axis)
                 self._canvases.append(canvas)
                 self._panel_hosts.append(host)
-                panels.addWidget(host, 1)
+                self._panels.addWidget(host, index // 2, index % 2, 1, 1)
+                self._panels.setColumnStretch(index % 2, 1)
+                self._panels.setRowStretch(index // 2, 1)
         except Exception as exc:
             self._error = exc
             hint = QLabel(
@@ -133,11 +143,31 @@ class SurfaceDataPreview(QWidget):
             outer.addWidget(hint)
             return
 
-        outer.addLayout(panels, 1)
+        outer.addLayout(self._panels, 1)
+        self.set_panel_count(2)
 
-    def set_data(self, raw, processed):
+    def set_panel_count(self, count):
+        """两面板（1×2）与四面板（2×2）布局切换，多余面板隐藏。"""
+        count = 4 if count >= 3 else 2
+        self._panel_count = count
+        for index, host in enumerate(self._panel_hosts):
+            host.setVisible(index < count)
+            # 切回两面板时复位绘图区上边距（四面板的下移只属于求解页）
+            if count == 2:
+                plot_layout = getattr(host, "plot_layout", None)
+                if plot_layout is not None and plot_layout.contentsMargins().top() != 0:
+                    plot_layout.setContentsMargins(0, 0, 0, 0)
+        # 隐藏部件不会取消其所在行的拉伸因子：两面板时必须把第二行拉伸清零，
+        # 否则空行仍占据一半高度，两个面板会被挤到上半部分
+        self._panels.setRowStretch(1, 1 if count == 4 else 0)
+        # 四面板大小调节：只给求解页四面板加边距，两面板恢复贴边
+        inset = self._four_panel_inset if count == 4 else 0
+        self._panels.setContentsMargins(inset, 0, inset, inset)
+
+    def set_panels(self, datasets, colorbar_label="面形误差 (nm)"):
         if self._error is not None:
             return
+        self.set_panel_count(len(datasets))
         for cb in self._colorbars:
             try:
                 cb.remove()
@@ -150,7 +180,7 @@ class SurfaceDataPreview(QWidget):
             cmap.set_bad("#d6e2f0")
         except Exception:
             cmap = "jet"
-        for ax, data in zip(self._axes, (raw, processed)):
+        for ax, data in zip(self._axes, datasets):
             ax.clear()
             ax.set_facecolor("#dfe9f5")
             ax.set_xticks([])
@@ -158,12 +188,16 @@ class SurfaceDataPreview(QWidget):
             im = ax.imshow(_downsample_2d(data), cmap=cmap, aspect="equal",
                            interpolation="nearest", origin="lower")
             cb = ax.figure.colorbar(im, ax=ax, fraction=0.05, pad=0.05)
-            cb.set_label("面形误差 (nm)", color="#10243f", fontsize=9)
+            if colorbar_label:
+                cb.set_label(colorbar_label, color="#10243f", fontsize=9)
             cb.ax.tick_params(labelsize=8, colors="#10243f")
             cb.outline.set_edgecolor("#10243f")
             self._colorbars.append(cb)
         for canvas in self._canvases:
             canvas.draw_idle()
+
+    def set_data(self, raw, processed, colorbar_label="面形误差 (nm)"):
+        self.set_panels((raw, processed), colorbar_label)
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -229,9 +263,14 @@ class PreviewCanvas(QWidget):
         self._idx_surface_data = self._stack.count()
         self._stack.addWidget(self._surface_data_preview)
         hosts = getattr(self._surface_data_preview, "_panel_hosts", [])
-        if len(hosts) >= 2:
-            self._label_dwell_sub_left = self._make_overlay_label(hosts[0])
-            self._label_dwell_sub_right = self._make_overlay_label(hosts[1])
+        # 每个面板一条第二横条说明；第一行面板需避开顶部介绍横幅，第二行不用
+        self._label_dwell_subs = []
+        for index, host in enumerate(hosts):
+            host.dwell_sub_bar_top_row = index < 2
+            self._label_dwell_subs.append(self._make_overlay_label(host))
+        if len(self._label_dwell_subs) >= 2:
+            self._label_dwell_sub_left = self._label_dwell_subs[0]
+            self._label_dwell_sub_right = self._label_dwell_subs[1]
 
     def _init_occ_widgets(self):
         try:
@@ -314,6 +353,9 @@ class PreviewCanvas(QWidget):
         label.show()
         label.raise_()
         self._place_overlay_labels()
+        # 面板在半宽/全宽间切换时此刻布局尚未完成，host.width() 是旧值；
+        # 延迟到事件循环再摆一次，让横条宽度跟随面板实际宽度占满
+        QtCore.QTimer.singleShot(0, self._place_overlay_labels)
 
     def set_surface_view_mode(self, mode):
         self._surface_view_mode = "overlay" if mode == "overlay" else "split"
@@ -338,11 +380,23 @@ class PreviewCanvas(QWidget):
             self._label_dwell.setGeometry(0, 0, width, height)
             self._label_dwell.raise_()
             offset = height
+        # 四面板（驻留时间求解）模式：绘图区整体下移到各自横条下方，避免遮挡；
+        # 两面板页面（面形/抛光斑）保持原有覆盖样式不变
+        preview = self._surface_data_preview
+        four_panel = preview is not None and getattr(preview, "_panel_count", 2) >= 3
         for host, label in self._label_hosts:
             if host is None or label is None:
                 continue
-            label.setGeometry(0, offset, max(1, host.width()), 30)
+            # 只有顶部一行面板（及 3D 覆盖条）需要避开介绍横幅
+            host_offset = offset-6 if getattr(host, "dwell_sub_bar_top_row", True) else 0
+            label.setGeometry(0, host_offset, max(1, host.width()), 30)
             label.raise_()
+            plot_layout = getattr(host, "plot_layout", None)
+            if plot_layout is not None:
+                # 32 = 横条高 30 + 2px 空隙；想让四个图再偏下，把这个数调大即可
+                top_gap = host_offset + 32 if four_panel else 0
+                if plot_layout.contentsMargins().top() != top_gap:
+                    plot_layout.setContentsMargins(0, top_gap, 0, 0)
 
     def set_dwell_banner(self, text):
         self._label_dwell.setText(text)
@@ -354,27 +408,29 @@ class PreviewCanvas(QWidget):
             self._label_dwell.hide()
             self._place_overlay_labels()
 
-    def set_dwell_sub_bar(self, left_text="处理前", right_text="处理后", visible=True):
-        """面形数据页面的第二横条：左/右面板上方的“处理前/处理后”说明。"""
-        if self._label_dwell_sub_left is not None:
-            self._label_dwell_sub_left.setText(left_text)
-            self._label_dwell_sub_left.setVisible(visible)
-        if self._label_dwell_sub_right is not None:
-            self._label_dwell_sub_right.setText(right_text)
-            self._label_dwell_sub_right.setVisible(visible)
+    def set_dwell_sub_bar(self, texts=("处理前", "处理后"), visible=True):
+        """第二横条：每个热力图面板上方一条说明。
+        两面板传 2 项（处理前/处理后），四面板传 4 项。"""
+        if isinstance(texts, str):
+            texts = (texts,)
+        labels = getattr(self, "_label_dwell_subs", [])
+        for index, label in enumerate(labels):
+            if label is None:
+                continue
+            if index < len(texts):
+                label.setText(texts[index])
+                label.setVisible(visible)
+            else:
+                label.hide()
         self._place_overlay_labels()
 
     def hide_dwell_sub_bar(self):
-        left_visible = (self._label_dwell_sub_left is not None and
-                        self._label_dwell_sub_left.isVisible())
-        right_visible = (self._label_dwell_sub_right is not None and
-                         self._label_dwell_sub_right.isVisible())
-        if not (left_visible or right_visible):
+        labels = getattr(self, "_label_dwell_subs", [])
+        if not any(label is not None and label.isVisible() for label in labels):
             return
-        if self._label_dwell_sub_left is not None:
-            self._label_dwell_sub_left.hide()
-        if self._label_dwell_sub_right is not None:
-            self._label_dwell_sub_right.hide()
+        for label in labels:
+            if label is not None:
+                label.hide()
         self._place_overlay_labels()
 
     def _sync_all_occ_views(self):
@@ -1085,14 +1141,24 @@ class PreviewCanvas(QWidget):
         self._display_shapes(self._display_traj, [self._sphere_shape(points[-1], radius)], color="RED", update=True)
         self._fit_display(self._display_traj, view="iso")
 
-    def plot_dwell_surface(self, raw, processed, raw_title="处理前", processed_title="处理后"):
+    def plot_dwell_surface(self, raw, processed, raw_title="处理前", processed_title="处理后",
+                           colorbar_label="面形误差 (nm)"):
         """驻留时间面形数据：左侧处理前原始面形，右侧处理后面形，二维热力图。"""
         if self._surface_data_preview is None:
             return
         self._stack.setCurrentIndex(self._idx_surface_data)
         QApplication.processEvents()
-        self._surface_data_preview.set_data(raw, processed)
-        self.set_dwell_sub_bar(raw_title, processed_title, True)
+        self._surface_data_preview.set_data(raw, processed, colorbar_label)
+        self.set_dwell_sub_bar((raw_title, processed_title), True)
+
+    def plot_dwell_solution(self, panels, titles, colorbar_label=""):
+        """驻留时间求解：2×2 四面板（上面两个+下面两个），每面板一条第二横条。"""
+        if self._surface_data_preview is None:
+            return
+        self._stack.setCurrentIndex(self._idx_surface_data)
+        QApplication.processEvents()
+        self._surface_data_preview.set_panels(panels, colorbar_label)
+        self.set_dwell_sub_bar(tuple(titles), True)
 
     def plot_dwell_model(self, model, surface_name):
         """驻留时间建模：把模型点云以带法向着色的三角网格显示在左侧单个面板。"""
@@ -1591,12 +1657,17 @@ class ControlPanel(TrajectoryPlanningMixin, DwellTimeMixin, QStackedWidget):
             self._main.preview.set_dwell_banner(text)
         else:
             self._main.preview.clear_dwell_banner()
-        # 面形数据页：已有面形数据时显示“处理前/处理后”第二横条，其余情况隐藏。
-        has_surface = (index == self.idx_dwell_surface and
-                       self._dwell_state.get("surface_raw") is not None and
-                       self._dwell_state.get("surface") is not None)
-        if has_surface:
-            self._main.preview.set_dwell_sub_bar(visible=True)
+        # 面形/抛光斑/求解页：已有数据时切回二维热力图并显示第二横条，其余情况隐藏。
+        if (index == self.idx_dwell_surface and
+                self._dwell_state.get("surface_raw") is not None and
+                self._dwell_state.get("surface") is not None):
+            self._dwell_refresh_surface_preview()
+        elif (index == self.idx_dwell_spot and
+                self._dwell_state.get("spot_before") is not None):
+            self._dwell_refresh_spot_preview()
+        elif (index == self.idx_dwell_solve and
+                self._dwell_state.get("solution") is not None):
+            self._dwell_refresh_solve_preview()
         else:
             self._main.preview.hide_dwell_sub_bar()
 
