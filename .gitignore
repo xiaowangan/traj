@@ -5,3 +5,5 @@ __pycache__/
 *.tmp
 *.log
 polishing/infrastructure/licensing/license.dat
+/pgd/
+/data/
