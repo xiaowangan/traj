@@ -1,0 +1,7 @@
+"""Unified migrated trajectory generation API."""
+from polishing.core.trajectory_planar_raster import generate_planar_raster
+from polishing.core.trajectory_planar_spiral import generate_planar_spiral
+from polishing.core.trajectory_aspherical import generate_aspherical
+from polishing.core.trajectory_spherical import generate_spherical, SPHERICAL_WALL_THICKNESS_MM
+from polishing.core.trajectory_cylindrical import generate_cylindrical, CYLINDRICAL_WALL_THICKNESS_MM
+from polishing.core.trajectory_conical import generate_conical

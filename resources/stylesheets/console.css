@@ -1,0 +1,80 @@
+/* 右侧控制台：沿用软件的蓝灰配色，只统一卡片、标签页、输入框和按钮的形态 */
+QScrollArea { border: 0; background: #dfe9f5; }
+QWidget#panelContent { background: #dfe9f5; }
+QLabel { background: transparent; color: #10243f; }
+
+QWidget#stageHeader { background: transparent; }
+QLabel#intro { color: #34516f; font-size: 12px; padding: 2px 2px 0 2px; }
+QLabel#stageStatus { color: #52657a; font-size: 11px; padding: 0 2px; }
+QLabel#stageStatus[status="done"] { color: #1a7a3c; }
+QLabel#stageStatus[status="stale"] { color: #b06a10; font-weight: 600; }
+
+QPushButton#pill {
+    background: #eef3fa; color: #34516f; border: 1px solid #b8c7d8;
+    border-radius: 13px; padding: 4px 14px; font-weight: 600;
+}
+QPushButton#pill:hover { background: #e2ebf6; border-color: #829bb5; }
+QPushButton#pill[active="true"] { background: #214f78; color: #ffffff; border-color: #214f78; }
+
+QGroupBox {
+    background: #f4f8fd; border: 1px solid #b8c7d8; border-radius: 8px;
+    margin-top: 12px; padding: 14px 8px 8px 8px; font-weight: 700; color: #10243f;
+}
+QGroupBox::title {
+    subcontrol-origin: margin; subcontrol-position: top left;
+    left: 10px; padding: 0 6px; background: #dfe9f5; border-radius: 4px;
+}
+
+QFrame#stepCard { background: #f4f8fd; border: 1px solid #b8c7d8; border-radius: 8px; }
+QLabel#stepBadge {
+    background: #214f78; color: #ffffff; border-radius: 12px; font-weight: 700;
+}
+QLabel#stepBadge[status="done"] { background: #1a7a3c; }
+QLabel#stepBadge[status="stale"] { background: #c98a0a; }
+QLabel#stepTitle { font-size: 13px; font-weight: 700; color: #10243f; }
+QLabel#stepHint { color: #52657a; font-size: 11px; }
+QLabel#stepState { color: #9a6a14; font-size: 11px; font-weight: 600; }
+QLabel#stepState[status="done"] { color: #1a7a3c; }
+
+QLineEdit, QComboBox {
+    background: #ffffff; border: 1px solid #b8c7d8; border-radius: 5px;
+    padding: 3px 6px; min-height: 20px; color: #10243f;
+}
+QLineEdit:focus, QComboBox:focus { border: 1px solid #214f78; }
+QLineEdit:read-only { background: #e8f0fa; }
+QComboBox QAbstractItemView { background: #ffffff; selection-background-color: #214f78; }
+
+QPushButton {
+    background: #f5f8fc; color: #34516f; border: 1px solid #b8c7d8;
+    border-radius: 5px; padding: 5px 12px;
+}
+QPushButton:hover:enabled { background: #e6eef7; border-color: #829bb5; }
+QPushButton:pressed:enabled { background: #d9e5f1; }
+QPushButton:disabled { background: #edf1f5; color: #9aa7b4; border-color: #d9e0e7; }
+QPushButton#primaryBtn {
+    background: #214f78; color: #ffffff; border: 1px solid #214f78; font-weight: 600;
+}
+QPushButton#primaryBtn:hover:enabled { background: #2d6396; }
+QPushButton#primaryBtn:disabled { background: #b4c3d3; border-color: #b4c3d3; color: #eef3f9; }
+QCheckBox { background: transparent; }
+QWidget#plainBox { background: transparent; }
+
+/* 前置条件提示 */
+QFrame#gate { background: #fff8e8; border: 1px solid #e4c276; border-radius: 8px; }
+QLabel#gateTitle { color: #73510d; font-weight: 700; }
+QPushButton#gateLink {
+    background: transparent; border: 0; color: #214f78; text-decoration: underline;
+    padding: 0 2px; text-align: left;
+}
+QPushButton#gateLink:hover { color: #2d6396; }
+
+/* 折叠区开关 */
+QPushButton#foldToggle {
+    background: transparent; border: 0; color: #34516f; font-weight: 600; padding: 2px 0;
+}
+QPushButton#foldToggle:hover { color: #214f78; }
+
+/* 被前置条件锁住时的样子 */
+QGroupBox:disabled { color: #9aa7b4; }
+QLabel:disabled { color: #9aa7b4; }
+QLineEdit:disabled, QComboBox:disabled { background: #eef2f7; color: #9aa7b4; }
